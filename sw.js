@@ -1,7 +1,7 @@
 // Offline support. App files load from the network when it answers quickly (so updates show up
 // right away) and from this cache otherwise. Firebase library files are versioned, so they're cache-first.
-const CACHE = 'sample-keys-v6';
-const CORE = ['./', 'index.html', 'sync.js', 'automap.js', 'record.js', 'firebase-config.js', 'manifest.webmanifest',
+const CACHE = 'sample-keys-v7';
+const CORE = ['./', 'index.html', 'sync.js', 'automap.js', 'compress.js', 'record.js', 'firebase-config.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

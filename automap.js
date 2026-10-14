@@ -35,6 +35,16 @@
     try { raw = await decodeAudio(bytes) } catch (e) { closeSheet(); toast(`Couldn't read "${file.name}". Try exporting it as WAV or M4A.`); A = null; return }
     if (raw.duration < 0.5) { closeSheet(); toast('That recording is too short to contain several notes.'); A = null; return }
     Object.assign(A, { bytes, mime: file.type || 'audio/wav', raw, sr: raw.sampleRate });
+    // big uncompressed takes (e.g. 32-bit float WAV from a field recorder) are stored as AAC; analyse what's stored
+    if (window.SKCompress && SKCompress.worth(file, bytes)) {
+      A.prog = .05; progress(`Compressing the recording (${SKCompress.mb(bytes.byteLength)})…`);
+      try {
+        const c = await SKCompress.compress(file, raw, bytes, f => { A.prog = .05 + .05 * f; progress(`Compressing the recording (${SKCompress.mb(bytes.byteLength)})… ${Math.round(f * 100)}%`) });
+        if (c) Object.assign(A, { bytes: c.bytes, mime: c.mime, raw: c.raw, sr: c.raw.sampleRate, compressed: `${SKCompress.mb(bytes.byteLength)} → ${SKCompress.mb(c.bytes.byteLength)}` });
+      } catch (e) { console.warn('Could not compress', e) }
+      if (A.cancel) return;
+      raw = A.raw;
+    }
 
     // mono mix at the recording's own rate, for exact note starts and pitch
     const n = raw.length, mono = new Float32Array(n), chs = raw.numberOfChannels;
@@ -178,7 +188,7 @@
     A.reviewing = true;
     const base = A.file.name.replace(/\.[^.]+$/, '');
     openSheet(`<h3 id="amTitle"></h3>
-      <p class="sub">From “${esc(A.file.name)}” (${fmtT(A.raw.duration)}). Check the list, preview anything that looks off, then map the notes to keys.</p>
+      <p class="sub">From “${esc(A.file.name)}” (${fmtT(A.raw.duration)}${A.compressed ? `, compressed ${A.compressed}` : ''}). Check the list, preview anything that looks off, then map the notes to keys.</p>
       <canvas class="amwave" id="amWave"></canvas>
       <div class="amopts">
         <label class="tf">Played <select id="amOrder"><option value="up">in order, low to high</option><option value="down">in order, high to low</option><option value="any">in any order</option></select></label>

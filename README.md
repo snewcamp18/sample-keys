@@ -26,6 +26,7 @@ everything is saved on the device you're using.
 - Record straight from the microphone, then keep it as one sound or auto-map it into notes
 - Auto-map: split one recording of many notes (e.g. every piano key in order) into one sound per key
 - Share an instrument with a link; family and friends add their own copy
+- Big uncompressed recordings (e.g. 32-bit float WAV from a field recorder) are compressed to AAC automatically, about 18× smaller
 - Export and import instruments as `.json` files
 
 Your instruments are private to your account. Setting up your own copy: see [SETUP.md](SETUP.md).

@@ -648,7 +648,27 @@ function parseNote(filename){
 async function decodeAudio(bytes){
   const tag=new TextDecoder().decode(new Uint8Array(bytes,0,Math.min(12,bytes.byteLength)));
   if(tag.startsWith('FORM')&&/AIF[FC]/.test(tag.slice(8))) return decodeAIFF(bytes);
-  return new Promise((res,rej)=>ctx.decodeAudioData(bytes.slice(0),res,rej)); // callback form also works on older iOS Safari
+  const buf=await new Promise((res,rej)=>ctx.decodeAudioData(bytes.slice(0),res,rej)); // callback form also works on older iOS Safari
+  return fixPriming(bytes,buf);
+}
+// Files compressed by compress.js carry a 'skpk' tag (encoder priming, true length, rate). Decoders that ignore the
+// file's edit list return the priming silence first; trim it so every device gets the same, sample-exact audio.
+function skTag(bytes){
+  if(bytes.byteLength<16)return null;
+  const v=new DataView(bytes),id=o=>String.fromCharCode(v.getUint8(o),v.getUint8(o+1),v.getUint8(o+2),v.getUint8(o+3));
+  if(id(4)!=='ftyp')return null;
+  const find=(start,end,type)=>{for(let o=start;o+8<=end;){const sz=v.getUint32(o);if(sz<8)return null;if(id(o+4)===type)return [o+8,o+sz];o+=sz}return null};
+  const moov=find(0,bytes.byteLength,'moov'),udta=moov&&find(moov[0],moov[1],'udta'),tag=udta&&find(udta[0],udta[1],'skpk');
+  return tag?{delay:v.getUint32(tag[0]),length:v.getUint32(tag[0]+4),rate:v.getUint32(tag[0]+8)}:null;
+}
+function fixPriming(bytes,buf){
+  const t=skTag(bytes);if(!t||!t.rate)return buf;
+  const k=buf.sampleRate/t.rate,length=Math.round(t.length*k),delay=Math.round(t.delay*k);
+  const skip=buf.length-length>=delay-Math.round(64*k)&&delay>0?delay:0;
+  if(!skip&&buf.length===length)return buf;
+  const n=Math.max(1,Math.min(length,buf.length-skip)),out=ctx.createBuffer(buf.numberOfChannels,n,buf.sampleRate);
+  for(let c=0;c<buf.numberOfChannels;c++)out.getChannelData(c).set(buf.getChannelData(c).subarray(skip,skip+n));
+  return out;
 }
 function decodeAIFF(bytes){
   const v=new DataView(bytes),id=o=>String.fromCharCode(v.getUint8(o),v.getUint8(o+1),v.getUint8(o+2),v.getUint8(o+3));
@@ -699,13 +719,18 @@ async function addFiles(files,atKey=null){
   let k=atKey,added=null;
   for(const f of audio){
     try{
-      const bytes=await f.arrayBuffer();
-      const raw=await decodeAudio(bytes);
+      let bytes=await f.arrayBuffer(),raw=await decodeAudio(bytes),mime=f.type||'audio/wav';
+      // big uncompressed recordings (e.g. 32-bit float WAV from a field recorder) are stored as AAC to save space
+      if(window.SKCompress&&SKCompress.worth(f,bytes)){
+        toast(`Compressing "${f.name}" (${SKCompress.mb(bytes.byteLength)})…`);
+        try{const c=await SKCompress.compress(f,raw,bytes);if(c){toast(`Compressed "${f.name}" from ${SKCompress.mb(bytes.byteLength)} to ${SKCompress.mb(c.bytes.byteLength)}`);({bytes,raw,mime}=c)}}
+        catch(e){console.warn('Could not compress',f.name,e)}
+      }
       let root=parseNote(f.name);
       if(k!==null){root=Math.min(HIGH,k++);samples=samples.filter(s=>s.root!==root)}
       else if(S.mode==='drum'){if(root===null||samples.some(s=>s.root===root))root=nextFreeKey()}
       else if(root===null) root=60;
-      const s=makeSample(f.name.replace(/\.[^.]+$/,''),bytes,f.type||'audio/wav',raw,root,pickColor());
+      const s=makeSample(f.name.replace(/\.[^.]+$/,''),bytes,mime,raw,root,pickColor());
       build(s);samples.push(s);added=s;
     }catch(e){toast(`Couldn't read "${f.name}". Try exporting it as WAV.`)}
   }
@@ -1637,6 +1662,7 @@ function checkShareLink(){
 </script>
 <script src="firebase-config.js"></script>
 <script src="sync.js"></script>
+<script src="compress.js"></script>
 <script src="automap.js"></script>
 <script src="record.js"></script>
 </body>
