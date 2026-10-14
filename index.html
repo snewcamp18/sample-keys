@@ -144,6 +144,7 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
 .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px 14px;margin-top:12px}
 .field label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
 .field input,.field select{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:5px 7px}
+.vrange{display:flex;align-items:center;gap:6px}.vrange input{min-width:0}.vrange span{color:var(--muted)}
 .field .mk{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:0}
 .edbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
 .edbtns .sp{flex:1}
@@ -198,6 +199,11 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
 .amdest .tx{margin:0 0 0 22px;width:calc(100% - 22px)}
 @media (max-width:640px){.amrow{grid-template-columns:auto 2em minmax(0,1fr) auto auto}.amrow .amt{display:none}}
 .mbox .link.danger{color:var(--bad)}
+.rctime{font:600 28px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center;margin:4px 0 14px;font-variant-numeric:tabular-nums}
+.rctime.rec{color:var(--bad)}
+.rctime.rec::before{content:"● ";animation:skpulse .8s infinite alternate}
+.rcplay{width:100%;margin:4px 0}
+.mbox .tf .tx{flex:1}
 .meter{margin:0 0 14px}
 .meterlbl{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px;font-variant-numeric:tabular-nums}
 .ambar i.full{background:var(--bad)}
@@ -318,6 +324,10 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
     <button data-act="export">Export instrument… <small>.json</small></button>
     <button data-act="import">Import instrument…</button>
     <button data-act="automap">Auto-map a recording…</button>
+    <button data-act="record">Record a sound…</button>
+    <hr>
+    <button data-act="shareinst">Share instrument…</button>
+    <button data-act="addshared">Add a shared instrument…</button>
     <hr>
     <button data-act="install">Install app…</button>
     <button data-act="share">Share app link</button>
@@ -352,7 +362,7 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
 
   <!-- ======= samples ======= -->
   <section class="panel">
-    <div class="phead"><h2>Samples</h2><span class="hint">Tap a sample to edit it below</span><span style="flex:1"></span><button class="btn sm" id="autoMapBtn" title="Split one recording of many notes into one sound per key">Auto-map a recording…</button><button class="btn sm x" id="clearSamples">Remove all</button></div>
+    <div class="phead"><h2>Samples</h2><span class="hint">Tap a sample to edit it below</span><span style="flex:1"></span><button class="btn sm" id="recBtn" title="Record a sound with this device's microphone">● Record</button><button class="btn sm" id="autoMapBtn" title="Split one recording of many notes into one sound per key">Auto-map a recording…</button><button class="btn sm x" id="clearSamples">Remove all</button></div>
     <label class="drop" id="drop">
       <input type="file" id="file" accept="audio/*,.wav,.aif,.aiff,.mp3,.ogg,.flac,.m4a,.caf,.json,.samplekeys,application/json" multiple hidden>
       <b class="desk">Drop audio files here</b><span class="desk"> or click to browse</span><b class="mob">Tap to add audio files</b>
@@ -388,6 +398,7 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
       <div class="field"><label>Gain (dB)</label><input type="number" id="f-gain" step="0.1" inputmode="decimal"></div>
       <div class="field"><label>Tune (semitones)</label><input type="number" id="f-tune" step="0.01" inputmode="decimal"></div>
       <div class="field"><label id="rootLbl">Root key</label><select id="f-root"></select></div>
+      <div class="field"><label title="This sound plays when a key is hit within this velocity range (1 = softest, 127 = hardest)">Plays at velocity</label><div class="vrange"><input type="number" id="f-vlo" min="1" max="127" step="1" inputmode="numeric" aria-label="Lowest velocity"><span>–</span><input type="number" id="f-vhi" min="1" max="127" step="1" inputmode="numeric" aria-label="Highest velocity"></div></div>
     </div>
     <div class="edbtns">
       <button class="btn" id="edPlay" title="Hold to play at the root note">▶ Hold to play</button>
@@ -476,7 +487,7 @@ function applyMix(){
 }
 
 /* =============== samples & editing model =============== */
-const defP=dur=>({start:0,end:dur,loop:false,loopStart:0,loopEnd:dur,fadeIn:0,fadeOut:0,gain:0,tune:0,reverse:false});
+const defP=dur=>({start:0,end:dur,loop:false,loopStart:0,loopEnd:dur,fadeIn:0,fadeOut:0,gain:0,tune:0,reverse:false,vlo:1,vhi:127});
 function makeSample(name,bytes,mime,raw,root,color){
   return {id:nextId++,name,bytes,mime,raw,rev:null,buffer:null,root,color,version:0,p:defP(raw.duration)};
 }
@@ -497,6 +508,8 @@ function normalizeP(p,dur){
   p.fadeOut=clamp(+p.fadeOut||0,0,len-p.fadeIn);
   p.gain=clamp(+p.gain||0,-48,36);
   p.tune=clamp(+p.tune||0,-48,48);
+  p.vlo=clamp(Math.round(+p.vlo||1),1,127);
+  p.vhi=clamp(Math.round(+p.vhi||127),p.vlo,127);
 }
 // Bake trim, reverse, gain and fades into the buffer that actually plays
 function build(s){
@@ -517,17 +530,29 @@ function build(s){
 }
 
 /* =============== key → sample mapping =============== */
-function mapNote(n){
+// Velocity layers: a sound whose velocity range doesn't include how hard the key was hit counts as LAYER_FAR
+// semitones further away, so the matching layer wins unless it's much further off in pitch than the other one.
+const LAYER_FAR=7;
+const inLayer=(s,vel)=>vel>=s.p.vlo&&vel<=s.p.vhi;
+const layersOverlap=(a,b)=>a.p.vlo<=b.p.vhi&&b.p.vlo<=a.p.vhi;
+function mapNote(n,vel=100){
   if(!samples.length) return null;
-  if(S.mode==='drum'){const s=samples.find(s=>s.root===n);return s?{s,rate:Math.pow(2,s.p.tune/12)}:null}
+  if(S.mode==='drum'){
+    const on=samples.filter(s=>s.root===n),s=on.find(x=>inLayer(x,vel))||on[0];
+    return s?{s,rate:Math.pow(2,s.p.tune/12)}:null;
+  }
   let best=null,bd=1e9;
-  for(const s of samples){const d=Math.abs(s.root-n);if(d<bd||(d===bd&&s.root<best.root)){bd=d;best=s}}
+  for(const s of samples){
+    const d=Math.abs(s.root-n)+(inLayer(s,vel)?0:LAYER_FAR);
+    if(d<bd||(d===bd&&(inLayer(s,vel)!==inLayer(best,vel)?inLayer(s,vel):s.root<best.root))){bd=d;best=s}
+  }
   return {s:best,rate:Math.pow(2,(n-best.root+best.p.tune)/12)};
 }
 function setRoot(s,n){
-  if(S.mode==='drum') samples.forEach(o=>{if(o!==s&&o.root===n)o.root=s.root});
+  if(S.mode==='drum') samples.forEach(o=>{if(o!==s&&o.root===n&&layersOverlap(o,s))o.root=s.root});
   s.root=n;
 }
+const layerName=p=>p.vlo===1&&p.vhi===127?'':p.vlo===1&&p.vhi===79?'soft layer':p.vlo===80&&p.vhi===127?'loud layer':`velocity ${p.vlo}–${p.vhi}`;
 
 /* =============== voices =============== */
 function noteOn(note,vel=100){
@@ -537,7 +562,7 @@ function noteOn(note,vel=100){
     learnId=null;renderSamples();refreshZones();syncFields();renderSeq();markDirty();
   }
   held.add(note);setKey(note,true);
-  const m=mapNote(note+S.transpose);if(!m) return;
+  const m=mapNote(note+S.transpose,vel);if(!m) return;
   ensureAudio();if(ctx.state!=='running') return;
   startVoice(m.s,m.rate,vel,note);
   recNoteOn(note+S.transpose,vel);
@@ -599,7 +624,7 @@ function panic(){
   held.forEach(n=>setKey(n,false));held.clear();RT.sustain=false;
 }
 function previewPitch(n,vel=100,dur=.3){
-  const m=mapNote(n);if(!m)return;
+  const m=mapNote(n,vel);if(!m)return;
   ensureAudio();if(ctx.state!=='running')return;
   const v=startVoice(m.s,m.rate,vel,2000+n);
   if(!(S.oneshot&&!v.loop)) release(v,Math.min(S.release,.4),ctx.currentTime+dur);
@@ -694,7 +719,7 @@ function renderSamples(){
   if(!samples.length){box.innerHTML='<div class="empty">No samples yet. Add one sound for a chromatic instrument, several with note names for a multi-sampled one, or many in Kit mode for drums.</div>';return}
   for(const s of [...samples].sort((a,b)=>a.root-b.root)){
     const el=document.createElement('div');el.className='sample'+(s===sel?' sel':'');
-    const flags=[s.p.loop&&'loop',s.p.reverse&&'reversed'].filter(Boolean).join(' · ');
+    const flags=[layerName(s.p),s.p.loop&&'loop',s.p.reverse&&'reversed'].filter(Boolean).join(' · ');
     el.innerHTML=`<div class="sw" style="background:${s.color}"></div>
       <div class="nm" title="${esc(s.name)}">${esc(s.name)}<small>${s.buffer.duration.toFixed(2)}s · ${zoneRange(s)}${flags?' · '+flags:''}</small></div>
       <canvas width="320" height="64"></canvas>
@@ -720,7 +745,8 @@ function renderSamples(){
 function zoneRange(s){
   if(S.mode==='drum') return 'key '+noteName(s.root);
   let lo=null,hi=null;
-  for(let n=LOW;n<=HIGH;n++){const m=mapNote(n);if(m&&m.s===s){if(lo===null)lo=n;hi=n}}
+  const v=Math.round((s.p.vlo+s.p.vhi)/2);
+  for(let n=LOW;n<=HIGH;n++){const m=mapNote(n,v);if(m&&m.s===s){if(lo===null)lo=n;hi=n}}
   return lo===null?'hidden by another sample on the same root':`root ${noteName(s.root)} · plays ${noteName(lo)}–${noteName(hi)}`;
 }
 const keyOpts=v=>{let h='';for(let n=LOW;n<=HIGH;n++)h+=`<option value="${n}"${n===v?' selected':''}>${noteName(n)}</option>`;return h};
@@ -780,7 +806,7 @@ function renderSeqNotes(){
   const idx=new Map(ROWS.map((r,i)=>[r.n,i])),sq=cur.seq,frag=document.createDocumentFragment();
   for(const n of sq.notes){
     const i=idx.get(n.n);if(i===undefined||n.s>=sq.steps)continue;
-    const m=mapNote(n.n),el=document.createElement('div');el.className='note';
+    const m=mapNote(n.n,n.v),el=document.createElement('div');el.className='note';
     el.style.cssText=`left:${n.s*CW+1}px;top:${i*RH+1}px;width:${Math.min(n.l,sq.steps-n.s)*CW-2}px;height:${RH-2}px;background:${m?m.s.color:'#666'};opacity:${.4+.6*n.v/127}`;
     frag.appendChild(el);
   }
@@ -853,7 +879,7 @@ function playStep(i,t){
   if(t<now-.05)return; // skip steps missed while the tab was in the background
   for(const n of cur.seq.notes){
     if(n.s!==i)continue;
-    const m=mapNote(n.n);if(!m)continue;
+    const m=mapNote(n.n,n.v);if(!m)continue;
     const v=startVoice(m.s,m.rate,n.v,1000+n.n,0,t),end=t+n.l*sd;
     if(!(S.oneshot&&!v.loop))release(v,S.release,end);
     const k=keyEls[n.n-S.transpose];
@@ -1069,7 +1095,7 @@ function syncFields(){
   const p=sel.p,set=(id,v)=>{const el=$(id);if(document.activeElement!==el)el.value=v};
   TIMEF.forEach(k=>set('f-'+k,p[k].toFixed(3)));
   MSF.forEach(k=>set('f-'+k,Math.round(p[k]*1000)));
-  set('f-gain',p.gain.toFixed(1));set('f-tune',+p.tune.toFixed(2));
+  set('f-gain',p.gain.toFixed(1));set('f-tune',+p.tune.toFixed(2));set('f-vlo',p.vlo);set('f-vhi',p.vhi);
   $('f-root').innerHTML=keyOpts(sel.root);
   $('c-loop').checked=p.loop;$('c-rev').checked=p.reverse;
 }
@@ -1084,6 +1110,11 @@ function commitEdit(){
   if(k==='fadeIn') v=Math.min(v,p.end-p.start-p.fadeOut);
   if(k==='fadeOut') v=Math.min(v,p.end-p.start-p.fadeIn);
   p[k]=v;commitEdit();
+}));
+['f-vlo','f-vhi'].forEach(id=>$(id).addEventListener('change',e=>{
+  if(!sel)return;const v=Math.round(+e.target.value);if(!v){syncFields();return}
+  sel.p[id==='f-vlo'?'vlo':'vhi']=v;if(sel.p.vlo>sel.p.vhi){if(id==='f-vlo')sel.p.vhi=sel.p.vlo;else sel.p.vlo=sel.p.vhi}
+  commitEdit();refreshZones();renderSeqNotes();
 }));
 $('f-root').onchange=e=>{if(!sel)return;setRoot(sel,+e.target.value);renderSamples();refreshZones();renderSeq();markDirty()};
 $('c-loop').onchange=e=>{if(!sel)return;sel.p.loop=e.target.checked;commitEdit()};
@@ -1266,13 +1297,14 @@ function buildKnobs(){
 $('modeSeg').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b||b.dataset.mode===S.mode)return;
   S.mode=b.dataset.mode;
-  if(S.mode==='drum'){const seen=new Set();if(samples.some(s=>seen.has(s.root)||!seen.add(s.root))){let k=36;[...samples].sort((a,b)=>a.root-b.root).forEach(s=>s.root=k++)}S.oneshot=true}
+  if(S.mode==='drum'){if(samples.some((a,i)=>samples.some((b,j)=>j>i&&a.root===b.root&&layersOverlap(a,b)))){let k=36;[...samples].sort((a,b)=>a.root-b.root).forEach(s=>s.root=k++)}S.oneshot=true}
   else S.oneshot=false;
   seqScrollTo=true;updateFace();renderSamples();refreshZones();syncFields();renderSeq();markDirty();
 });
 $('oneshot').onchange=e=>{S.oneshot=e.target.checked;markDirty()};
 $('vellayer').onchange=e=>{S.vellayer=e.target.checked;markDirty()};
 $('panic').onclick=panic;
+$('recBtn').onclick=()=>window.SKRecord?SKRecord.open():toast('Recording could not load.');
 $('autoMapBtn').onclick=()=>window.SKAutoMap?SKAutoMap.open():toast('Auto-map could not load.');
 $('clearSamples').onclick=async()=>{
   if(!samples.length)return;
@@ -1438,6 +1470,9 @@ async function fileAct(act){
   else if(act==='export') exportInst();
   else if(act==='import') $('importFile').click();
   else if(act==='automap') window.SKAutoMap&&SKAutoMap.open();
+  else if(act==='record') window.SKRecord?SKRecord.open():toast('Recording could not load.');
+  else if(act==='shareinst') window.SKSync?SKSync.share(cur.id):toast('Sharing needs the online app.');
+  else if(act==='addshared') window.SKSync?SKSync.addShared():toast('Sharing needs the online app.');
   else if(act==='install') installApp();
   else if(act==='share') shareApp();
   else if(act==='delete'){
@@ -1523,6 +1558,14 @@ window.SK={
   ready,toast,openSheet,closeSheet,esc,
   getIndex:()=>db?dbAll('index'):Promise.resolve([]),
   getRecord:id=>db?dbGet('instruments',id):Promise.resolve(null),
+  flush,
+  // a shared instrument someone sent: save it as a new instrument here and open it (sync uploads it if signed in)
+  async importRecord(rec){
+    await flush();
+    if(db){await dbPut('instruments',rec);await dbPut('index',{id:rec.id,name:rec.name,updated:rec.updated,count:rec.samples.length,pushed:false})}
+    await loadInstrument(rec);
+    window.SKSync&&SKSync.changed(rec.id);
+  },
   // an instrument changed on another device; reload it here unless there are unsaved edits (those win and upload)
   async putRemote(rec){
     if(!db)return;
@@ -1566,6 +1609,11 @@ window.SK={
 };
 $('syncBtn').onclick=()=>window.SKSync?SKSync.open():openSheet('<h3>Sync</h3><p class="sub">Sync could not load in this copy of Sample Keys.</p><div class="row"><button class="btn pri" data-close>Close</button></div>');
 
+function checkShareLink(){
+  const m=location.hash.match(/^#share=([A-Za-z0-9]{8,40})$/);if(!m)return;
+  history.replaceState(null,'',location.pathname+location.search);
+  window.SKSync?SKSync.openShare(m[1]):toast('Open this link in the online app to add the shared instrument.');
+}
 /* =============== start =============== */
 (async()=>{
   lastLayoutW=innerWidth;
@@ -1582,11 +1630,14 @@ $('syncBtn').onclick=()=>window.SKSync?SKSync.open():openSheet('<h3>Sync</h3><p 
   }
   await loadInstrument(rec||blankInst());
   readyRes();
+  checkShareLink();
+  window.addEventListener('hashchange',checkShareLink); // a share link opened while the app is already open in this tab
   initMIDI();requestAnimationFrame(tick);
 })();
 </script>
 <script src="firebase-config.js"></script>
 <script src="sync.js"></script>
 <script src="automap.js"></script>
+<script src="record.js"></script>
 </body>
 </html>

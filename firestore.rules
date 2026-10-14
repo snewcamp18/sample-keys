@@ -5,6 +5,7 @@ rules_version = '2';
 //    transaction, and the counter can't go past the storage limit (150 MiB). The counter can only change
 //    together with a matching chunk upload or deletion, so it can't be reset or edited on its own.
 //  - Instrument and file-info documents must have the shape the app writes.
+//  - Shared instruments live in /shares; their sound files become readable to others only while marked public.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -20,7 +21,7 @@ service cloud.firestore {
       return d.keys().hasOnly(['name', 'updated', 'deleted', 'settings', 'seq', 'art', 'samples'])
         && d.name is string && d.name.size() <= 200
         && d.updated is number && d.deleted is bool
-        && (!('samples' in d) || (d.samples is list && d.samples.size() <= 128))
+        && (!('samples' in d) || (d.samples is list && d.samples.size() <= 512))
         && (!('settings' in d) || d.settings is map)
         && (!('seq' in d) || d.seq == null || (d.seq is map && (!('notes' in d.seq) || (d.seq.notes is list && d.seq.notes.size() <= 4096))))
         && (!('art' in d) || d.art == null || (d.art is string && d.art.size() <= 64));
@@ -35,18 +36,45 @@ service cloud.firestore {
         && (!('done' in d) || d.done is bool);
     }
 
+    function validShare(d) {
+      return d.keys().hasOnly(['owner', 'instId', 'by', 'name', 'updated', 'inst'])
+        && d.owner == request.auth.uid
+        && d.instId is string && d.instId.size() <= 64
+        && d.by is string && d.by.size() <= 60
+        && d.name is string && d.name.size() <= 200
+        && d.updated is number
+        && d.inst is map && validInstrument(d.inst);
+    }
+    // a file is readable by others only while one of its owner's share links uses it
+    function isPublic(uid, h) { return exists(/databases/$(database)/documents/users/$(uid)/public/$(h)); }
+
+    // shared instruments: anyone with the (unguessable) link id can read one; only its owner can change it
+    match /shares/{sid} {
+      allow get: if true;
+      allow list: if request.auth != null && resource.data.owner == request.auth.uid;
+      allow create: if request.auth != null && validShare(request.resource.data);
+      allow update: if request.auth != null && resource.data.owner == request.auth.uid && validShare(request.resource.data);
+      allow delete: if request.auth != null && resource.data.owner == request.auth.uid;
+    }
+
     match /users/{uid} {
+      match /public/{h} {
+        allow read, delete: if signedIn(uid);
+        allow create, update: if signedIn(uid) && h.size() <= 64 && request.resource.data.keys().hasOnly(['at']);
+      }
+
       match /instruments/{id} {
         allow read, delete: if signedIn(uid);
         allow create, update: if signedIn(uid) && validInstrument(request.resource.data);
       }
 
       match /blobs/{h} {
-        allow read, delete: if signedIn(uid);
+        allow read: if signedIn(uid) || isPublic(uid, h);
+        allow delete: if signedIn(uid);
         allow create, update: if signedIn(uid) && h.size() <= 64 && validBlob(request.resource.data);
 
         match /chunks/{i} {
-          allow read: if signedIn(uid);
+          allow read: if signedIn(uid) || isPublic(uid, h);
           allow create: if signedIn(uid)
             && i.size() == 4
             && request.resource.data.keys().hasOnly(['d'])

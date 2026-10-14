@@ -5,6 +5,8 @@
  *   users/{uid}/blobs/{sha256}            file info; written first with done:false, set done:true once every chunk is up
  *   users/{uid}/blobs/{sha256}/chunks/{n} up to 700 KB of the file each (Firestore documents max out at 1 MiB)
  *   users/{uid}/meta/usage                bytes of sound stored; the rules make every chunk upload/delete update it
+ *   users/{uid}/public/{sha256}           marks one of your files as readable through a share link
+ *   shares/{random id}                    a snapshot of an instrument someone shared; readable by anyone with the link
  *
  * Audio is stored once per distinct file (content hash), so editing an instrument only rewrites its small
  * settings document. Conflicts resolve last-writer-wins on `updated`; deletions are kept as tombstones so
@@ -25,6 +27,7 @@
   let state = 'loading', detail = '', queue = Promise.resolve(), sheetOpen = false, busyMsg = '';
   let view = 'main', usageBytes = null, deleting = false;
   const pushTimers = new Map();
+  const refused = new Map();  // instrument id -> version the cloud refused; not retried until it changes again
   let known = new Map();   // blob hash -> when it was last confirmed complete in the cloud
 
   class QuotaError extends Error {
@@ -36,7 +39,8 @@
   const loadKnown = () => { try { known = new Map(JSON.parse(localStorage.getItem(knownKey()) || '[]')) } catch (e) { known = new Map() } };
   const saveKnown = () => { try { localStorage.setItem(knownKey(), JSON.stringify([...known])) } catch (e) {} };
 
-  function setState(s, d = '') { state = s; detail = d; SK.setSyncState(s); if (sheetOpen && view === 'main') render() }
+  const ours = () => sheetOpen && !!document.querySelector('#sheet.show #sheetBox [data-owner="sync"]');
+  function setState(s, d = '') { state = s; detail = d; SK.setSyncState(s); if (ours() && view === 'main') render() }
   // one sync job at a time, so pulls, pushes and clean-ups never interleave
   function run(fn) {
     queue = queue.then(fn).catch(e => {
@@ -52,11 +56,17 @@
   const instCol = () => F.collection(fs, ...U(), 'instruments');
   const instDoc = id => F.doc(fs, ...U(), 'instruments', id);
   const blobCol = () => F.collection(fs, ...U(), 'blobs');
-  const blobDoc = h => F.doc(fs, ...U(), 'blobs', h);
+  const blobDoc = (h, uid = user.uid) => F.doc(fs, 'users', uid, 'blobs', h);
   const chunkId = i => String(i).padStart(4, '0');
   const chunkDoc = (h, i) => F.doc(fs, ...U(), 'blobs', h, 'chunks', chunkId(i));
-  const chunkCol = h => F.collection(fs, ...U(), 'blobs', h, 'chunks');
+  const chunkCol = (h, uid = user.uid) => F.collection(fs, 'users', uid, 'blobs', h, 'chunks');
   const usageDoc = () => F.doc(fs, ...U(), 'meta', 'usage');
+  const pubDoc = h => F.doc(fs, ...U(), 'public', h);
+  const pubCol = () => F.collection(fs, ...U(), 'public');
+  const shareCol = () => F.collection(fs, 'shares');
+  const myShares = () => F.getDocs(F.query(shareCol(), F.where('owner', '==', user.uid)));
+  const instHashes = r => [...(r.samples || []).map(s => s.hash), r.art].filter(Boolean);
+  let fbReadyRes; const fbReady = new Promise(r => fbReadyRes = r);
 
   const shaMemo = new WeakMap();
   async function sha(buf) {
@@ -98,7 +108,7 @@
       if ((usageBytes ?? 0) + u8.length > QUOTA) { await readUsage(); if (usageBytes + u8.length > QUOTA) throw new QuotaError() }
       await F.setDoc(ref, { mime: mime || '', size: u8.length, chunks: n, part: CHUNK, created: Date.now(), done: false });
       for (let i = 0; i < n; i++) {
-        busyMsg = n > 1 ? `Uploading sound (${i + 1}/${n})…` : 'Uploading sound…'; if (sheetOpen && view === 'main') render();
+        busyMsg = n > 1 ? `Uploading sound (${i + 1}/${n})…` : 'Uploading sound…'; if (ours() && view === 'main') render();
         await putChunk(h, i, u8.subarray(i * CHUNK, (i + 1) * CHUNK));
       }
       await F.updateDoc(ref, { done: true });
@@ -111,26 +121,28 @@
     await F.deleteDoc(blobDoc(h));
     known.delete(h); saveKnown();
   }
-  async function fetchBlob(h) {
+  async function fetchBlob(h, owner) {
     const local = await SK.findBytes(h);
     if (local) return local;
-    const meta = await F.getDoc(blobDoc(h));
+    owner = owner || user.uid;
+    const meta = await F.getDoc(blobDoc(h, owner));
     const still = 'A sound for this instrument is still uploading from your other device.';
     if (!meta.exists() || meta.data().done === false) throw new Error(still);
     const { size } = meta.data(), out = new Uint8Array(size);
-    busyMsg = 'Downloading sound…'; if (sheetOpen && view === 'main') render();
-    const snap = await F.getDocs(chunkCol(h)); // ids are zero-padded, so they come back in order
+    busyMsg = 'Downloading sound…'; if (ours() && view === 'main') render();
+    const snap = await F.getDocs(chunkCol(h, owner)); // ids are zero-padded, so they come back in order
     let o = 0;
     for (const d of snap.docs) { const u = d.data().d.toUint8Array(); out.set(u, o); o += u.length }
     busyMsg = '';
     if (o !== size) throw new Error(still);
-    known.set(h, Date.now()); saveKnown();
+    if (user && owner === user.uid) { known.set(h, Date.now()); saveKnown() }
     return out.buffer;
   }
   // remove files that no live instrument uses any more (deleted instruments, removed samples)
   async function gc() {
     const live = new Set();
-    (await F.getDocs(instCol())).forEach(d => { const r = d.data(); if (r.deleted) return; (r.samples || []).forEach(s => live.add(s.hash)); if (r.art) live.add(r.art) });
+    (await F.getDocs(instCol())).forEach(d => { const r = d.data(); if (!r.deleted) instHashes(r).forEach(h => live.add(h)) });
+    (await myShares()).forEach(d => instHashes(d.data().inst || {}).forEach(h => live.add(h)));
     for (const b of (await F.getDocs(blobCol())).docs) {
       const m = b.data();
       if (!live.has(b.id) && Date.now() - (m.created || 0) >= GC_MIN_AGE) await deleteBlob(b.id, m);
@@ -147,6 +159,17 @@
     if (!user || deleting) return;
     const rec = await SK.getRecord(id);
     if (!rec) return;
+    if (refused.get(id) === rec.updated) return;
+    try { await pushRecord(id, rec); refused.delete(id) }
+    catch (e) {
+      if (e && e.code === 'permission-denied' && !e.quota) {
+        refused.set(id, rec.updated);
+        throw new Error(`"${rec.name}" couldn't be saved to the cloud. It may have too many sounds (the limit is 512).`);
+      }
+      throw e;
+    }
+  }
+  async function pushRecord(id, rec) {
     const hashes = [], list = [];
     for (const s of rec.samples || []) {
       const h = s.hash || await sha(s.bytes);
@@ -208,8 +231,8 @@
   }
 
   async function load() {
-    if (!cfg) { setState('nosetup'); return }
-    if (location.protocol === 'file:') { setState('nosetup', 'file'); return }
+    if (!cfg) { setState('nosetup'); fbReadyRes(); return }
+    if (location.protocol === 'file:') { setState('nosetup', 'file'); fbReadyRes(); return }
     setState(navigator.onLine ? 'loading' : 'offline');
     try {
       const [app, a, f] = await Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map(n => import(FB + n)));
@@ -226,6 +249,7 @@
         A.connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
         F.connectFirestoreEmulator(fs, '127.0.0.1', 8080);
       }
+      fbReadyRes();
       A.onAuthStateChanged(auth, u => {
         if (unsub) { unsub(); unsub = null }
         user = u;
@@ -250,6 +274,9 @@
     if (unsub) { unsub(); unsub = null }
     await queue;
     try {
+      progress('Turning off share links…');
+      for (const d of (await myShares()).docs) await F.deleteDoc(d.ref);
+      for (const d of (await F.getDocs(pubCol())).docs) await F.deleteDoc(d.ref);
       progress('Deleting instruments…');
       for (const d of (await F.getDocs(instCol())).docs) await F.deleteDoc(d.ref);
       const blobs = (await F.getDocs(blobCol())).docs;
@@ -320,9 +347,9 @@
           <div class="ambar"><i style="width:${used == null ? 0 : Math.max(used > 0 ? 1 : 0, used * 100)}%" class="${used > .9 ? 'full' : ''}"></i></div></div>
         <div class="row"><button class="btn pri" id="skNow">Sync now</button><button class="btn" id="skOut">Sign out</button>${close}</div>
         <div class="row between"><button class="link danger" id="skDel">Delete my account…</button></div>`;
-      if (usageBytes == null && state !== 'offline') readUsage().then(() => { if (sheetOpen && view === 'main') render() }).catch(() => {});
+      if (usageBytes == null && state !== 'offline') readUsage().then(() => { if (ours() && view === 'main') render() }).catch(() => {});
     }
-    SK.openSheet(h, () => { sheetOpen = false; if (view === 'delete') view = 'main' });
+    SK.openSheet(`<div data-owner="sync">${h}</div>`, () => { sheetOpen = false; if (view === 'delete') view = 'main' });
     sheetOpen = true;
     wire();
   }
@@ -359,8 +386,118 @@
     };
   }
 
+  /* ---------- sharing ---------- */
+  const appUrl = () => location.origin + location.pathname.replace(/index\.html$/, '');
+  const sharer = () => (user.displayName || (user.email || '').split('@')[0] || 'Someone').slice(0, 60);
+  const shareSheet = (h, wide) => { sheetOpen = false; SK.openSheet(`<div data-owner="share">${h}</div>`, null, wide) };
+  const closeBtn = '<button class="btn" data-close>Close</button>';
+  const sizeOf = inst => { const seen = new Map(); (inst.samples || []).forEach(s => seen.set(s.hash, s.size || 0)); return [...seen.values()].reduce((a, b) => a + b, 0) };
+
+  async function shareFor(id) { return (await F.getDocs(F.query(shareCol(), F.where('owner', '==', user.uid), F.where('instId', '==', id)))).docs[0] || null }
+  async function publish(id) {
+    await SK.flush();
+    let err = null;
+    await run(async () => { setState('syncing'); try { await push(id) } catch (e) { err = e } setState(err ? 'error' : 'synced', err ? err.message : '') });
+    if (err) throw err;
+    const snap = await F.getDoc(instDoc(id));
+    if (!snap.exists() || snap.data().deleted) throw new Error("This instrument hasn't synced yet. Check SYNC, then try again.");
+    const inst = snap.data();
+    for (const h of instHashes(inst)) await F.setDoc(pubDoc(h), { at: Date.now() });
+    const old = await shareFor(id), ref = old ? old.ref : F.doc(shareCol());
+    await F.setDoc(ref, { owner: user.uid, instId: id, by: sharer(), name: inst.name, updated: Date.now(), inst });
+    return { link: appUrl() + '#share=' + ref.id, inst };
+  }
+  async function unpublish(id) {
+    const old = await shareFor(id);
+    if (old) await F.deleteDoc(old.ref);
+    const keep = new Set();
+    (await myShares()).forEach(d => instHashes(d.data().inst || {}).forEach(h => keep.add(h)));
+    for (const m of (await F.getDocs(pubCol())).docs) if (!keep.has(m.id)) await F.deleteDoc(m.ref);
+  }
+  const noCloud = () => shareSheet(`<h3>Sharing</h3><p class="sub">Sharing works in the online app. Open Sample Keys from its web address and try again.</p><div class="row">${closeBtn}</div>`);
+  async function share(id) {
+    await fbReady;
+    if (!fs) { noCloud(); return }
+    if (!user) {
+      shareSheet(`<h3>Share an instrument</h3><p class="sub">Sign in first. Sharing puts a copy of this instrument where family and friends can add it to their own Sample Keys.</p>
+        <div class="row">${closeBtn}<button class="btn pri" id="shSignIn">Sign in</button></div>`);
+      document.getElementById('shSignIn').onclick = () => { view = 'main'; render() };
+      return;
+    }
+    if (!navigator.onLine) { shareSheet(`<h3>Share an instrument</h3><p class="sub">You're offline. Connect to the internet to share.</p><div class="row">${closeBtn}</div>`); return }
+    shareSheet(`<h3>Share an instrument</h3><p class="sub">Preparing a link… uploading any sounds that haven't synced yet.</p><div class="ambar"><i style="width:100%" class="busy"></i></div>`);
+    try {
+      const { link, inst } = await publish(id);
+      const mb = (sizeOf(inst) / 1048576).toFixed(1), n = (inst.samples || []).length;
+      shareSheet(`<h3>Share “${SK.esc(inst.name)}”</h3>
+        <p class="sub">Anyone with this link can add a copy (${n} sound${n === 1 ? '' : 's'}, ${mb} MB) to their own Sample Keys. They get the instrument as it is now; to send later changes, share it again and the same link updates.</p>
+        <input class="tx" id="shLink" readonly value="${SK.esc(link)}">
+        <div class="row"><button class="btn pri" id="shCopy">Copy link</button>${navigator.share ? '<button class="btn" id="shSend">Send…</button>' : ''}</div>
+        <p class="hint" style="margin:10px 0 0">On iPhone, links open in Safari. If they use the home-screen app, they can paste the link into <b>FILE → Add a shared instrument</b> there instead.</p>
+        <div class="row between"><button class="link danger" id="shStop">Stop sharing</button>${closeBtn}</div>`);
+      const $ = i => document.getElementById(i);
+      $('shLink').onfocus = e => e.target.select();
+      $('shCopy').onclick = async () => { try { await navigator.clipboard.writeText(link); SK.toast('Link copied') } catch (e) { $('shLink').focus() } };
+      if ($('shSend')) $('shSend').onclick = () => navigator.share({ title: inst.name + ' · Sample Keys', text: `Here's my "${inst.name}" instrument for Sample Keys:`, url: link }).catch(() => {});
+      $('shStop').onclick = async () => {
+        $('shStop').disabled = true;
+        try { await unpublish(id); SK.closeSheet(); SK.toast('Sharing turned off. The link no longer works.') }
+        catch (e) { console.error(e); SK.toast("Couldn't turn off sharing: " + e.message); $('shStop').disabled = false }
+      };
+    } catch (e) {
+      console.error(e);
+      shareSheet(`<h3>Share an instrument</h3><p class="err">${SK.esc(e.message || String(e))}</p><div class="row">${closeBtn}</div>`);
+    }
+  }
+  function addShared() {
+    shareSheet(`<h3>Add a shared instrument</h3><p class="sub">Paste the link someone sent you.</p>
+      <input class="tx" id="shPaste" placeholder="https://…#share=…" autocomplete="off" inputmode="url">
+      <p class="err" id="shErr"></p>
+      <div class="row">${closeBtn}<button class="btn pri" id="shOpen">Continue</button></div>`);
+    const go = () => {
+      const m = document.getElementById('shPaste').value.match(/share=([A-Za-z0-9]{8,40})/);
+      if (!m) { document.getElementById('shErr').textContent = "That doesn't look like a Sample Keys share link."; return }
+      openShare(m[1]);
+    };
+    document.getElementById('shOpen').onclick = go;
+    document.getElementById('shPaste').onkeydown = e => { if (e.key === 'Enter') go() };
+  }
+  async function openShare(sid) {
+    if (!navigator.onLine) { shareSheet(`<h3>Shared instrument</h3><p class="sub">You're offline. Connect to the internet, then open the link again.</p><div class="row">${closeBtn}</div>`); return }
+    shareSheet(`<h3>Shared instrument</h3><p class="sub">Looking it up…</p>`);
+    try {
+      await fbReady;
+      if (!fs) { noCloud(); return }
+      const snap = await F.getDoc(F.doc(fs, 'shares', sid));
+      if (!snap.exists()) throw new Error('This link was turned off, or it was copied incompletely.');
+      const { owner, by, inst } = snap.data(), n = (inst.samples || []).length, mb = (sizeOf(inst) / 1048576).toFixed(1);
+      shareSheet(`<h3>${SK.esc(inst.name)}</h3>
+        <p class="sub">Shared by <b>${SK.esc(by || 'someone')}</b> · ${n} sound${n === 1 ? '' : 's'} · ${mb} MB</p>
+        <p class="sub">${user ? 'It will be added to your instruments and synced to your devices.' : 'It will be added to this device. Sign in with SYNC to have it on your other devices too.'}</p>
+        <div class="row">${closeBtn}<button class="btn pri" id="shAdd">Add to my instruments</button></div>`);
+      document.getElementById('shAdd').onclick = async () => {
+        try {
+          const got = new Map(), list = [], uniq = [...new Set((inst.samples || []).map(s => s.hash))];
+          for (let i = 0; i < uniq.length; i++) {
+            shareSheet(`<h3>${SK.esc(inst.name)}</h3><p class="sub">Downloading sounds (${i + 1} of ${uniq.length})…</p><div class="ambar"><i style="width:${Math.round(100 * i / uniq.length)}%"></i></div>`);
+            got.set(uniq[i], await fetchBlob(uniq[i], owner));
+          }
+          for (const m of inst.samples || []) list.push({ name: m.name, bytes: got.get(m.hash), mime: m.mime, root: m.root, color: m.color, p: m.p, hash: m.hash });
+          const art = inst.art ? dec.decode(await fetchBlob(inst.art, owner)) : null;
+          const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+          await SK.importRecord({ id, name: inst.name, updated: Date.now(), settings: inst.settings || {}, seq: inst.seq || null, art, samples: list });
+          SK.closeSheet(); SK.toast(`Added "${inst.name}"`);
+        } catch (e) { console.error(e); shareSheet(`<h3>${SK.esc(inst.name)}</h3><p class="err">Couldn't download it: ${SK.esc(e.message || String(e))}</p><div class="row">${closeBtn}</div>`) }
+      };
+    } catch (e) {
+      console.error(e);
+      shareSheet(`<h3>Shared instrument</h3><p class="err">${SK.esc(e.message || String(e))}</p><div class="row">${closeBtn}</div>`);
+    }
+  }
+
   window.SKSync = {
     open() { view = 'main'; render() },
+    share, addShared, openShare,
     changed(id) {
       if (!user || deleting) return;
       clearTimeout(pushTimers.get(id));

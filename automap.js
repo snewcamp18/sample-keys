@@ -187,9 +187,11 @@
       </div>
       <div class="amlist" id="amList"></div>
       <div class="amdest">
+        <label class="tf">Velocity layer <select id="amLayer"><option value="all">All velocities (one take)</option><option value="soft">Soft layer: velocity 1–79</option><option value="loud">Loud layer: velocity 80–127</option></select></label>
+        <p class="hint" style="margin:0">For soft and loud layers, record the keys twice. Map the first take as a new instrument, then the second with “Add to”.</p>
         <label class="chk"><input type="radio" name="amDest" value="new" checked> New instrument named</label>
         <input class="tx" id="amName" value="${esc(base)}" autocomplete="off">
-        <label class="chk"><input type="radio" name="amDest" value="cur"> Add to “${esc(cur.name)}” (replaces sounds on the same keys)</label>
+        <label class="chk"><input type="radio" name="amDest" value="cur"> Add to “${esc(cur.name)}” (replaces sounds on the same keys and layer)</label>
       </div>
       <div class="row"><button class="btn" data-close>Cancel</button><button class="btn pri" id="amGo"></button></div>`,
       () => { stopPreview(); A = null }, true);
@@ -256,6 +258,8 @@
     for (const r of rows) if (!seen.has(r.key)) { seen.add(r.key); use.push(r) }   // first take of a key wins
     const toNew = document.querySelector('input[name=amDest]:checked').value === 'new';
     const name = (document.getElementById('amName').value.trim() || 'Recorded instrument');
+    const layer = document.getElementById('amLayer').value, [vlo, vhi] = { all: [1, 127], soft: [1, 79], loud: [80, 127] }[layer];
+    const overlaps = s => s.p.vlo <= vhi && vlo <= s.p.vhi;
     const { bytes, mime, raw } = A;
     stopPreview();
     A.reviewing = false;
@@ -264,19 +268,19 @@
       await flush();
       await loadInstrument({ ...blankInst(), name });
     } else {
-      samples = samples.filter(s => !seen.has(s.root));
+      samples = samples.filter(s => !(seen.has(s.root) && overlaps(s)));
     }
     S.mode = 'melodic';
     const label = toNew ? name : name.slice(0, 40);
     use.sort((a, b) => a.key - b.key).forEach((r, i) => {
-      const s = makeSample(`${label} ${noteName(r.key)}`, bytes, mime, raw, r.key, COLORS[i % COLORS.length]);
-      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2) });
+      const s = makeSample(`${label} ${noteName(r.key)}${layer === 'all' ? '' : ' ' + layer}`, bytes, mime, raw, r.key, COLORS[i % COLORS.length]);
+      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2), vlo, vhi });
       normalizeP(s.p, raw.duration); build(s); samples.push(s);
     });
     selectSample(samples.find(s => s.root === use[0].key) || samples[0] || null);
     seqScrollTo = true;
     updateFace(); renderSamples(); refreshZones(); syncFields(); renderSeq(); markDirty();
-    toast(`Mapped ${use.length} note${use.length === 1 ? '' : 's'}${use.length ? ` from ${noteName(use[0].key)} to ${noteName(use[use.length - 1].key)}` : ''}`);
+    toast(`Mapped ${use.length} note${use.length === 1 ? '' : 's'}${use.length ? ` from ${noteName(use[0].key)} to ${noteName(use[use.length - 1].key)}` : ''}${layer === 'all' ? '' : ` as the ${layer} layer`}`);
   }
 
   /* ---------- entry points ---------- */
