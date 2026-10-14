@@ -197,6 +197,11 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
 .amdest{display:grid;gap:8px;margin-bottom:12px}
 .amdest .tx{margin:0 0 0 22px;width:calc(100% - 22px)}
 @media (max-width:640px){.amrow{grid-template-columns:auto 2em minmax(0,1fr) auto auto}.amrow .amt{display:none}}
+.mbox .link.danger{color:var(--bad)}
+.meter{margin:0 0 14px}
+.meterlbl{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px;font-variant-numeric:tabular-nums}
+.ambar i.full{background:var(--bad)}
+.ambar i.busy{animation:skpulse .8s infinite alternate}
 .btn.pri{background:var(--accent);border-color:var(--accent);color:#1a1205;font-weight:600}
 .modal{position:fixed;inset:0;background:#000a;display:none;place-items:center;z-index:50;padding:16px}
 .modal.show{display:grid}
@@ -1542,6 +1547,11 @@ window.SK={
     const rec=await dbGet('instruments',id);
     if(rec&&rec.updated===updated&&rec.samples.some((s,i)=>s.hash!==hashes[i])){rec.samples.forEach((s,i)=>s.hash=hashes[i]);await dbPut('instruments',rec)}
     if(id===cur.id&&rec)rec.samples.forEach((r,i)=>{const s=samples.find(x=>!x.hash&&x.name===r.name&&x.bytes.byteLength===r.bytes.byteLength);if(s)s.hash=hashes[i]});
+  },
+  async clearLocal(){
+    if(!db)return;
+    for(const ix of await dbAll('index')){await dbDel('instruments',ix.id);await dbDel('index',ix.id)}
+    clearTimeout(saveT);saveT=null;await loadInstrument(blankInst());
   },
   async findBytes(h){
     const s=samples.find(x=>x.hash===h);if(s)return s.bytes;

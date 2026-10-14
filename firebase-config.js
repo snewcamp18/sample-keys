@@ -9,3 +9,6 @@ window.SK_FIREBASE_CONFIG = {
   messagingSenderId: "958768837641",
   appId: "1:958768837641:web:392aa57fad2836d49e74d8"
 };
+
+// App Check (optional, recommended once the app is online): the reCAPTCHA v3 site key, see SETUP.md.
+window.SK_APPCHECK_SITE_KEY = null;

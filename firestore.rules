@@ -1,9 +1,90 @@
 rules_version = '2';
+// Sample Keys database rules.
+//  - Each signed-in person can only read and write their own data under users/{their uid}.
+//  - Sound files are stored as chunks; every chunk write must update a per-person byte counter in the same
+//    transaction, and the counter can't go past the storage limit (150 MiB). The counter can only change
+//    together with a matching chunk upload or deletion, so it can't be reset or edited on its own.
+//  - Instrument and file-info documents must have the shape the app writes.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each person can read and write only their own instruments and sounds.
-    match /users/{uid}/{document=**} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+
+    function quota() { return 157286400; } // 150 MiB of sound per person
+    function signedIn(uid) { return request.auth != null && request.auth.uid == uid; }
+    function usagePath(uid) { return /databases/$(database)/documents/users/$(uid)/meta/usage; }
+    function chunkPath(uid, ref) {
+      return /databases/$(database)/documents/users/$(uid)/blobs/$(ref.split('/')[0])/chunks/$(ref.split('/')[1]);
+    }
+    function usedBefore(uid) { return exists(usagePath(uid)) ? get(usagePath(uid)).data.bytes : 0; }
+
+    function validInstrument(d) {
+      return d.keys().hasOnly(['name', 'updated', 'deleted', 'settings', 'seq', 'art', 'samples'])
+        && d.name is string && d.name.size() <= 200
+        && d.updated is number && d.deleted is bool
+        && (!('samples' in d) || (d.samples is list && d.samples.size() <= 128))
+        && (!('settings' in d) || d.settings is map)
+        && (!('seq' in d) || d.seq == null || (d.seq is map && (!('notes' in d.seq) || (d.seq.notes is list && d.seq.notes.size() <= 4096))))
+        && (!('art' in d) || d.art == null || (d.art is string && d.art.size() <= 64));
+    }
+    function validBlob(d) {
+      return d.keys().hasOnly(['mime', 'size', 'chunks', 'part', 'created', 'done'])
+        && d.mime is string && d.mime.size() <= 100
+        && d.size is int && d.size >= 0 && d.size <= quota()
+        && d.chunks is int && d.chunks >= 0 && d.chunks <= 9999
+        && (!('part' in d) || (d.part is int && d.part > 0 && d.part <= 716800))
+        && (!('created' in d) || d.created is number)
+        && (!('done' in d) || d.done is bool);
+    }
+
+    match /users/{uid} {
+      match /instruments/{id} {
+        allow read, delete: if signedIn(uid);
+        allow create, update: if signedIn(uid) && validInstrument(request.resource.data);
+      }
+
+      match /blobs/{h} {
+        allow read, delete: if signedIn(uid);
+        allow create, update: if signedIn(uid) && h.size() <= 64 && validBlob(request.resource.data);
+
+        match /chunks/{i} {
+          allow read: if signedIn(uid);
+          allow create: if signedIn(uid)
+            && i.size() == 4
+            && request.resource.data.keys().hasOnly(['d'])
+            && request.resource.data.d is bytes
+            && request.resource.data.d.size() <= 716800
+            && getAfter(usagePath(uid)).data.last == h + '/' + i
+            && getAfter(usagePath(uid)).data.bytes == usedBefore(uid) + request.resource.data.d.size()
+            && getAfter(usagePath(uid)).data.bytes <= quota();
+          // deleting a chunk gives its bytes back; files stored before the counter existed can always be deleted
+          allow delete: if signedIn(uid) && (
+            !exists(usagePath(uid))
+            || (getAfter(usagePath(uid)).data.last == 'del:' + h + '/' + i
+                && getAfter(usagePath(uid)).data.bytes == get(usagePath(uid)).data.bytes - resource.data.d.size()));
+        }
+      }
+
+      match /meta/usage {
+        allow read: if signedIn(uid);
+        allow create, update: if signedIn(uid)
+          && request.resource.data.keys().hasOnly(['bytes', 'last'])
+          && request.resource.data.bytes is int && request.resource.data.bytes >= 0
+          && request.resource.data.bytes <= quota()
+          && request.resource.data.last is string
+          && (
+            // counting a chunk uploaded in this same transaction
+            (!request.resource.data.last.matches('del:.*')
+              && !exists(chunkPath(uid, request.resource.data.last))
+              && existsAfter(chunkPath(uid, request.resource.data.last))
+              && request.resource.data.bytes == usedBefore(uid) + getAfter(chunkPath(uid, request.resource.data.last)).data.d.size())
+            ||
+            // un-counting a chunk deleted in this same transaction
+            (request.resource.data.last.matches('del:.*')
+              && exists(chunkPath(uid, request.resource.data.last.split(':')[1]))
+              && !existsAfter(chunkPath(uid, request.resource.data.last.split(':')[1]))
+              && request.resource.data.bytes == usedBefore(uid) - get(chunkPath(uid, request.resource.data.last.split(':')[1])).data.d.size())
+          );
+        allow delete: if signedIn(uid) && resource.data.bytes == 0;
+      }
     }
   }
 }
