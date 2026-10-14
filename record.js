@@ -5,12 +5,29 @@
  * (Safari, recent Chrome) — the same format as iPhone Voice Memos, which every device can decode — and as a
  * 16-bit WAV otherwise, so a recording made on one device always plays on the others after syncing.
  *
+ * Any input the device offers can be picked (a USB recorder or audio interface such as a Zoom H4essential in
+ * audio-interface mode shows up as a microphone); the choice is remembered. Stereo inputs are kept in stereo.
+ *
  * Shares the page's global scope with index.html (ctx, ensureAudio, addFiles, openSheet, …).
  */
 (() => {
   const MAX_SECONDS = 10 * 60;
   let stream = null, recorder = null, chunks = [], proc = null, pcm = [], analyser = null, srcNode = null;
   let t0 = 0, raf = 0, take = null, count = 1, peaks = [];
+
+  const MIC_KEY = 'sk-mic';
+  const savedMic = () => { try { return localStorage.getItem(MIC_KEY) || '' } catch (e) { return '' } };
+  const saveMic = id => { try { localStorage.setItem(MIC_KEY, id) } catch (e) {} };
+  // fill the microphone list; names only appear once the browser has been allowed to use a microphone
+  async function listMics() {
+    const sel = document.getElementById('rcDev'); if (!sel || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    const mics = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId !== 'communications');
+    const want = savedMic();
+    sel.innerHTML = '<option value="">Default microphone</option>' + mics.filter(d => d.deviceId && d.deviceId !== 'default')
+      .map((d, i) => `<option value="${esc(d.deviceId)}"${d.deviceId === want ? ' selected' : ''}>${esc(d.label || 'Microphone ' + (i + 1))}</option>`).join('');
+    document.getElementById('rcDevWrap').hidden = mics.length < 2 && !mics.some(d => d.label);
+  }
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', () => listMics().catch(() => {}));
 
   const mp4Type = () => window.MediaRecorder && ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/aac'].find(t => MediaRecorder.isTypeSupported(t));
   const fmt = s => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`;
@@ -20,11 +37,15 @@
   }
   function idle(msg = '') {
     sheet(`<p class="sub">Uses this device's microphone. Find a quiet spot; for a piano, hold the phone close to the strings with the lid open.</p>
+      <label class="tf" id="rcDevWrap" style="margin-bottom:12px">Microphone <select id="rcDev" style="flex:1;min-width:0"><option value="">Default microphone</option></select></label>
+      <p class="hint" style="margin:-4px 0 12px">Using a USB recorder like a Zoom H4essential? Plug it in, set it to audio-interface mode, and pick it here.</p>
       <canvas class="amwave" id="rcWave"></canvas>
       <div class="rctime" id="rcTime">0:00.0</div>
       ${msg ? `<p class="err">${msg}</p>` : ''}
       <div class="row"><button class="btn" data-close>Cancel</button><button class="btn pri" id="rcGo">● Start recording</button></div>`);
     document.getElementById('rcGo').onclick = start;
+    document.getElementById('rcDev').onchange = e => saveMic(e.target.value);
+    listMics().catch(() => {});
   }
 
   async function start() {
@@ -34,7 +55,16 @@
     ensureAudio();
     try { await ctx.resume() } catch (e) {}
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      const dev = (document.getElementById('rcDev') || {}).value || savedMic();
+      const audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } };
+      if (dev) audio.deviceId = { exact: dev };
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio }) }
+      catch (e) {
+        if (!dev || (e && e.name !== 'OverconstrainedError' && e.name !== 'NotFoundError')) throw e;
+        saveMic(''); delete audio.deviceId;               // the remembered device was unplugged: use the default
+        stream = await navigator.mediaDevices.getUserMedia({ audio });
+        toast('That microphone isn\'t connected, so the default one is being used.');
+      }
     } catch (e) {
       const name = e && e.name;
       idle(name === 'NotAllowedError' || name === 'SecurityError'
@@ -53,13 +83,16 @@
     } else {
       // no AAC recorder in this browser: capture raw samples and write a WAV
       pcm = [];
-      proc = ctx.createScriptProcessor(4096, 1, 1);
+      const chs = Math.min(2, (stream.getAudioTracks()[0].getSettings().channelCount) || 1);
+      proc = ctx.createScriptProcessor(4096, chs, chs);
       const mute = ctx.createGain(); mute.gain.value = 0;
-      proc.onaudioprocess = e => pcm.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      proc.onaudioprocess = e => { const b = e.inputBuffer; pcm.push([...Array(b.numberOfChannels)].map((_, c) => new Float32Array(b.getChannelData(c)))) };
       srcNode.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
     }
     t0 = performance.now(); peaks = [];
-    sheet(`<p class="sub">Recording… Play your notes, then tap Stop.</p>
+    const track = stream.getAudioTracks()[0], st = track.getSettings ? track.getSettings() : {};
+    const from = track.label ? `${esc(track.label)}${st.channelCount === 2 ? ' · stereo' : ''}` : '';
+    sheet(`<p class="sub">Recording${from ? ' from <b>' + from + '</b>' : ''}… Play your notes, then tap Stop.</p>
       <canvas class="amwave" id="rcWave"></canvas>
       <div class="rctime rec" id="rcTime">0:00.0</div>
       <div class="row"><button class="btn danger" id="rcStop">■ Stop</button></div>`);
@@ -124,12 +157,13 @@
     document.getElementById('rcMap').onclick = () => { const f = file(); count++; window.SKAutoMap ? SKAutoMap.analyse(f) : toast('Auto-map could not load.') };
   }
 
-  function wav(parts, sr) {
-    const n = parts.reduce((a, p) => a + p.length, 0), b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
-    const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
-    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
-    let o = 44; for (const p of parts) for (let i = 0; i < p.length; i++, o += 2) v.setInt16(o, Math.max(-1, Math.min(1, p[i])) * 32767, true);
+  function wav(blocks, sr) {
+    const ch = blocks.length ? blocks[0].length : 1, n = blocks.reduce((a, p) => a + p[0].length, 0), bytes = n * ch * 2;
+    const b = new ArrayBuffer(44 + bytes), v = new DataView(b), w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    w(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, bytes, true);
+    let o = 44;
+    for (const blk of blocks) for (let i = 0; i < blk[0].length; i++) for (let c = 0; c < ch; c++, o += 2) v.setInt16(o, Math.max(-1, Math.min(1, blk[c][i])) * 32767, true);
     return new Blob([b], { type: 'audio/wav' });
   }
   function release() {
