@@ -10,5 +10,5 @@ window.SK_FIREBASE_CONFIG = {
   appId: "1:958768837641:web:392aa57fad2836d49e74d8"
 };
 
-// App Check (optional, recommended once the app is online): the reCAPTCHA v3 site key, see SETUP.md.
-window.SK_APPCHECK_SITE_KEY = null;
+// App Check (optional, recommended once the app is online): the Fraud Defense (reCAPTCHA Enterprise) site key, see SETUP.md.
+window.SK_APPCHECK_SITE_KEY = "6Lejee0tAAAAAKKa66pNDmolArxynP8-V-prspYs";

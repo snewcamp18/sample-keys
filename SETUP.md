@@ -37,10 +37,11 @@ database rather than Firebase Storage because Storage now requires a billing acc
 
 ## 2. App Check (blocks requests that don't come from the app)
 
-1. Create a reCAPTCHA key at <https://www.google.com/recaptcha/admin/create>: label `Sample Keys`, type
-   **Score based (v3)**, domain `yourname.github.io`. Submit, then copy the **site key** and the **secret key**.
-2. In Firebase, open **Security → App Check → Apps**, click your web app, choose **reCAPTCHA**, paste the
-   **secret key** and save.
+1. In Firebase, open **Security → App Check → Apps**, click your web app and expand **Fraud Defense (formerly
+   reCAPTCHA Enterprise)**. Follow its link to create a key in Google Cloud: platform **Website**, domain
+   `yourname.github.io`, no checkbox challenge. Copy the key's ID (the **site key**).
+2. Paste the site key into the Fraud Defense box in Firebase and save. (Skip the plain **reCAPTCHA** option; Google
+   has retired it.)
 3. Put the **site key** in `firebase-config.js`: `window.SK_APPCHECK_SITE_KEY = "…";` and publish the update.
 4. Open the app on its web address and sign in once. Then in **App Check → APIs**, check that Cloud Firestore
    shows verified requests, and click **Enforce** for **Cloud Firestore** and **Authentication**.

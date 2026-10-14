@@ -219,7 +219,7 @@
       const siteKey = window.SK_APPCHECK_SITE_KEY;
       if (siteKey && !cfg.useEmulators && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
         const ac = await import(FB + 'firebase-app-check.js');
-        ac.initializeAppCheck(fbApp, { provider: new ac.ReCaptchaV3Provider(siteKey), isTokenAutoRefreshEnabled: true });
+        ac.initializeAppCheck(fbApp, { provider: new ac.ReCaptchaEnterpriseProvider(siteKey), isTokenAutoRefreshEnabled: true });
       }
       auth = A.getAuth(fbApp); fs = F.getFirestore(fbApp);
       if (cfg.useEmulators) { // local testing only: Firebase's emulator suite on this computer
