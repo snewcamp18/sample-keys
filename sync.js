@@ -175,7 +175,7 @@
       const h = s.hash || await sha(s.bytes);
       hashes.push(h);
       await ensureBlob(h, s.bytes, s.mime);
-      list.push({ name: s.name, mime: s.mime || '', root: s.root, color: s.color || '', p: clean(s.p), hash: h, size: s.bytes.byteLength });
+      list.push({ sid: s.sid || '', name: s.name, mime: s.mime || '', root: s.root, color: s.color || '', p: clean(s.p), hash: h, size: s.bytes.byteLength });
     }
     let art = null;
     if (rec.art) { const b = enc.encode(rec.art).buffer; art = await sha(b); await ensureBlob(art, b, 'text/plain') }
@@ -189,7 +189,7 @@
     const samples = [], got = new Map();
     for (const m of r.samples || []) {
       if (!got.has(m.hash)) got.set(m.hash, await fetchBlob(m.hash));
-      samples.push({ name: m.name, bytes: got.get(m.hash), mime: m.mime, root: m.root, color: m.color, p: m.p, hash: m.hash });
+      samples.push({ sid: m.sid, name: m.name, bytes: got.get(m.hash), mime: m.mime, root: m.root, color: m.color, p: m.p, hash: m.hash });
     }
     const art = r.art ? dec.decode(await fetchBlob(r.art)) : null;
     await SK.putRemote({ id, name: r.name, updated: r.updated, settings: r.settings || {}, seq: r.seq || null, art, samples });
@@ -482,7 +482,7 @@
             shareSheet(`<h3>${SK.esc(inst.name)}</h3><p class="sub">Downloading sounds (${i + 1} of ${uniq.length})…</p><div class="ambar"><i style="width:${Math.round(100 * i / uniq.length)}%"></i></div>`);
             got.set(uniq[i], await fetchBlob(uniq[i], owner));
           }
-          for (const m of inst.samples || []) list.push({ name: m.name, bytes: got.get(m.hash), mime: m.mime, root: m.root, color: m.color, p: m.p, hash: m.hash });
+          for (const m of inst.samples || []) list.push({ sid: m.sid, name: m.name, bytes: got.get(m.hash), mime: m.mime, root: m.root, color: m.color, p: m.p, hash: m.hash });
           const art = inst.art ? dec.decode(await fetchBlob(inst.art, owner)) : null;
           const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
           await SK.importRecord({ id, name: inst.name, updated: Date.now(), settings: inst.settings || {}, seq: inst.seq || null, art, samples: list });
