@@ -514,6 +514,16 @@ function makeSample(name,bytes,mime,raw,root,color){
   return {id:nextId++,sid:uid(),name,bytes,mime,raw,rev:null,buffer:null,root,color,version:0,p:defP(raw.duration)};
 }
 const durOf=s=>s.raw.duration;
+// loudest point (0–1, all channels) of a stretch of a recording
+function peakOf(raw,start=0,end=raw.duration){
+  const sr=raw.sampleRate,a=Math.max(0,Math.floor(start*sr)),b=Math.min(raw.length,Math.ceil(end*sr));let pk=0;
+  for(let c=0;c<raw.numberOfChannels;c++){const d=raw.getChannelData(c);for(let i=a;i<b;i++){const v=d[i]<0?-d[i]:d[i];if(v>pk)pk=v}}
+  return pk;
+}
+// New sounds are brought up so their loudest point sits at -1 dB. Quiet recordings (phones, 32-bit float field
+// recorders) otherwise play far too softly. Never turns anything down, and boosts at most 30 dB so a near-silent
+// file doesn't become loud hiss. It's the sound's Volume / Gain setting, so it can be changed afterwards.
+const autoGain=pk=>pk>0?+clamp(-1-20*Math.log10(pk),0,30).toFixed(1):0;
 function baseData(s,c){ // channel data in the editor's timeline (reversed if Reverse is on)
   if(!s.p.reverse) return s.raw.getChannelData(c);
   if(!s.rev) s.rev=[];
@@ -769,6 +779,8 @@ async function addFiles(files,atKey=null){
       else if(S.mode==='drum'){if(root===null||samples.some(s=>s.root===root))root=nextFreeKey()}
       else if(root===null) root=60;
       const s=makeSample(f.name.replace(/\.[^.]+$/,''),bytes,mime,raw,root,pickColor());
+      s.p.gain=autoGain(peakOf(raw));
+      if(s.p.gain>=3)toast(`"${s.name}" was quiet, so its volume was raised ${s.p.gain} dB`);
       build(s);samples.push(s);added=s;
     }catch(e){toast(`Couldn't read "${f.name}". Try exporting it as WAV.`)}
   }
@@ -1229,9 +1241,8 @@ $('bTrim').onclick=()=>{
   commitEdit();$('zRegion').onclick();
 };
 $('bNorm').onclick=()=>{
-  if(!sel)return;const s=sel,p=s.p,sr=s.raw.sampleRate,a=Math.floor(p.start*sr),b=Math.floor(p.end*sr);let peak=0;
-  for(let c=0;c<s.raw.numberOfChannels;c++){const d=baseData(s,c);for(let i=a;i<b;i++){const v=Math.abs(d[i]);if(v>peak)peak=v}}
-  if(peak>0){p.gain=-20*Math.log10(peak)-.3;commitEdit()}
+  if(!sel)return;const p=sel.p,peak=peakOf(sel.raw,p.start,p.end);
+  if(peak>0){p.gain=+(-20*Math.log10(peak)-.3).toFixed(1);commitEdit()}
 };
 $('bLoopAll').onclick=()=>{if(!sel)return;const p=sel.p;p.loop=true;p.loopStart=p.start;p.loopEnd=p.end;commitEdit()};
 $('bReset').onclick=()=>{if(!sel)return;sel.p=defP(durOf(sel));fitView();commitEdit()};

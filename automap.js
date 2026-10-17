@@ -282,15 +282,24 @@
     }
     S.mode = 'melodic';
     const label = toNew ? name : name.slice(0, 40);
+    // one volume boost for the whole take, so the notes keep their natural balance. When this take is a second
+    // velocity layer, both layers share the smaller boost so the soft take stays softer than the loud one.
+    let boost = autoGain(peakOf(raw));
+    const otherLayer = toNew || layer === 'all' ? [] : samples.filter(s => !overlaps(s));
+    if (otherLayer.length) {
+      const theirs = Math.max(...otherLayer.map(s => s.p.gain));
+      if (boost < theirs) otherLayer.forEach(s => { s.p.gain = +(s.p.gain - (theirs - boost)).toFixed(1) });
+      else boost = theirs;
+    }
     use.sort((a, b) => a.key - b.key).forEach((r, i) => {
       const s = makeSample(`${label} ${noteName(r.key)}${layer === 'all' ? '' : ' ' + layer}`, bytes, mime, raw, r.key, COLORS[i % COLORS.length]);
-      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2), vlo, vhi });
+      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2), vlo, vhi, gain: boost });
       normalizeP(s.p, raw.duration); build(s); samples.push(s);
     });
     selectSample(samples.find(s => s.root === use[0].key) || samples[0] || null);
     seqScrollTo = true;
     updateFace(); renderSamples(); refreshZones(); syncFields(); renderSeq(); markDirty();
-    toast(`Mapped ${use.length} note${use.length === 1 ? '' : 's'}${use.length ? ` from ${noteName(use[0].key)} to ${noteName(use[use.length - 1].key)}` : ''}${layer === 'all' ? '' : ` as the ${layer} layer`}`);
+    toast(`Mapped ${use.length} note${use.length === 1 ? '' : 's'}${use.length ? ` from ${noteName(use[0].key)} to ${noteName(use[use.length - 1].key)}` : ''}${layer === 'all' ? '' : ` as the ${layer} layer`}${boost >= 3 ? ` · volume raised ${boost} dB` : ''}`);
   }
 
   /* ---------- entry points ---------- */
