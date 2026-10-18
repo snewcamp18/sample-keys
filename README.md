@@ -23,6 +23,7 @@ everything is saved on the device you're using.
 - MIDI controllers in Chrome and Edge on Mac, Windows and Android (iPhone browsers don't support MIDI)
 - Step sequencer with swing, live recording and a click track; sequence any of an instrument's sounds, by pitch or one row per sound
 - Per-sound tune, volume, attack, release, tone, reverb and pan, alongside the instrument-wide knobs
+- Effects: drive, lo-fi, resonance, tempo-synced echo, reverb size, chorus, vibrato, tremolo, wah, filter envelope and glide
 - Soft and loud velocity layers: record each key twice and the app picks the take that matches how hard you play
 - Record straight from the microphone, then keep it as one sound or auto-map it into notes
 - Auto-map: split one recording of many notes (e.g. every piano key in order) into one sound per key

@@ -60,7 +60,10 @@ main{padding:18px 20px calc(60px + env(safe-area-inset-bottom));display:grid;gri
 .knobs{display:grid;grid-template-columns:repeat(4,1fr);gap:12px 6px}
 .knob{text-align:center;cursor:ns-resize;user-select:none;touch-action:none}
 .knob svg{width:50px;height:50px;display:block;margin:0 auto 2px}
-.kscope{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}
+.kscope{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap;min-width:0}
+.kpages{flex:1 1 100%;overflow-x:auto;scrollbar-width:none}.kpages::-webkit-scrollbar{display:none}
+.kpages button{flex:1;white-space:nowrap}
+.knobs:empty::after{content:"No per-sound settings on this page";grid-column:1/-1;color:var(--muted);font-size:12px;text-align:center;padding:20px 0}
 .ksname{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .ksname i{flex:none;width:8px;height:8px;border-radius:2px}
 .knob.inh .val{stroke:var(--muted)}
@@ -293,6 +296,7 @@ select{background:var(--panel);border:1px solid var(--line);border-radius:6px;pa
       </div>
       <div class="controls">
         <div class="kscope">
+          <div class="seg kpages" id="kPage"><button data-pg="main" class="sel">Main</button><button data-pg="character">Character</button><button data-pg="space">Space</button><button data-pg="movement">Movement</button><button data-pg="shape">Shape</button></div>
           <div class="seg" id="kScope"><button data-s="inst" class="sel" title="Knobs change the whole instrument">Instrument</button><button data-s="sound" title="Knobs change only the selected sound">This sound</button></div>
           <span class="ksname" id="kName"></span>
         </div>
@@ -456,7 +460,8 @@ function confirmBox(text,yes='Delete'){
 }
 
 /* =============== state =============== */
-const DEF={mode:'melodic',volumeDb:-2,tune:0,attack:.003,release:.35,cutoff:1,reverb:.15,velsens:.75,bend:2,transpose:0,oneshot:false,vellayer:true};
+const DEF={mode:'melodic',volumeDb:-2,tune:0,attack:.003,release:.35,cutoff:1,reverb:.15,velsens:.75,bend:2,transpose:0,oneshot:false,vellayer:true,
+  drive:0,crush:0,reso:0,echo:0,echoTime:3,echoFb:.35,revSize:.4,chorus:0,vib:0,trem:0,wah:0,lfoRate:5,fenv:0,fenvTime:.5,glide:0};
 const defSeq=()=>({bpm:100,steps:16,swing:0,len:1,vel:100,notes:[]});
 const S={...DEF};                                  // saved with the instrument
 const RT={octave:60,bendSemis:0,sustain:false};    // live performance state
@@ -466,26 +471,70 @@ const voices=new Map();   // key -> [voice]; keys: played note, -1 editor auditi
 const held=new Set();
 
 /* =============== audio graph =============== */
-// Each voice feeds two buses: dry, and a reverb send whose level comes from the sound's own Reverb knob or,
-// if it has none, the instrument's. The instrument's Tone filters both buses.
-let ctx,dryBus,revBus,inBus,filter,filterR,conv,master;
+// Each voice feeds a dry bus plus three effect sends: reverb, echo and chorus. A send's level comes from the
+// sound's own knob or, if it has none, the instrument's. On the dry and reverb buses sit the instrument's Tone
+// (with Resonance) and the Wah. One shared LFO drives vibrato, tremolo and wah, so they move together.
+let ctx,dryBus,revBus,inBus,filter,filterR,conv,master,echoIn,echoDelay,echoFbG,chorusIn,lfo,wahD,wahR,wahDepth,crushReady=false;
 function ensureAudio(){
   if(!ctx){
     ctx=new (window.AudioContext||window.webkitAudioContext)();
     dryBus=ctx.createGain();revBus=ctx.createGain();inBus=dryBus;
     filter=ctx.createBiquadFilter();filter.type='lowpass';filter.Q.value=.7;
     filterR=ctx.createBiquadFilter();filterR.type='lowpass';filterR.Q.value=.7;
-    conv=ctx.createConvolver();conv.buffer=impulse(2.6);
+    // wah: a resonant peak swept by the LFO; at Wah 0 its boost is 0 dB, so it does nothing
+    wahD=ctx.createBiquadFilter();wahD.type='peaking';wahD.frequency.value=900;wahD.Q.value=5;
+    wahR=ctx.createBiquadFilter();wahR.type='peaking';wahR.frequency.value=900;wahR.Q.value=5;
+    conv=ctx.createConvolver();conv.buffer=impulse(revSeconds());
     master=ctx.createGain();
     const comp=ctx.createDynamicsCompressor();comp.threshold.value=-6;comp.ratio.value=8;
-    dryBus.connect(filter);filter.connect(master);
-    revBus.connect(filterR);filterR.connect(conv);conv.connect(master);
+    dryBus.connect(filter);filter.connect(wahD);wahD.connect(master);
+    revBus.connect(filterR);filterR.connect(wahR);wahR.connect(conv);conv.connect(master);
+    // echo: delay with feedback; repeats get a little darker each time round
+    echoIn=ctx.createGain();echoDelay=ctx.createDelay(4);echoFbG=ctx.createGain();
+    const echoTone=ctx.createBiquadFilter();echoTone.type='lowpass';echoTone.frequency.value=5000;
+    echoIn.connect(echoDelay);echoDelay.connect(echoTone);echoTone.connect(echoFbG);echoFbG.connect(echoDelay);echoTone.connect(master);
+    // chorus: two slowly wobbling short delays, one per side
+    lfo=ctx.createOscillator();lfo.type='sine';lfo.start();
+    chorusIn=ctx.createGain();
+    const merge=ctx.createChannelMerger(2);
+    [[.6,0],[.83,1]].forEach(([hz,side])=>{
+      const d=ctx.createDelay(.1),o=ctx.createOscillator(),og=ctx.createGain();
+      d.delayTime.value=.018;o.frequency.value=hz;og.gain.value=.004;o.connect(og);og.connect(d.delayTime);o.start();
+      chorusIn.connect(d);d.connect(merge,0,side);
+    });
+    merge.connect(master);
+    wahDepth=ctx.createGain();lfo.connect(wahDepth);wahDepth.connect(wahD.detune);wahDepth.connect(wahR.detune);
     master.connect(comp);comp.connect(ctx.destination);
+    // lo-fi: a tiny AudioWorklet that holds samples (lower sample rate) and rounds them (fewer bits)
+    if(ctx.audioWorklet)ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([CRUSH_WORKLET],{type:'application/javascript'})))
+      .then(()=>{crushReady=true}).catch(e=>console.warn('Lo-fi unavailable',e));
     applyMix();
   }
   if(ctx.state!=='running') ctx.resume().catch(()=>{});
   setTimeout(()=>$('banner').classList.toggle('show',ctx.state!=='running'),250);
   return ctx;
+}
+const CRUSH_WORKLET=`class SKCrush extends AudioWorkletProcessor{
+  static get parameterDescriptors(){return [{name:'amount',defaultValue:0,minValue:0,maxValue:1}]}
+  constructor(){super();this.h=[0,0];this.c=[0,0]}
+  process(ins,outs,par){
+    const x=ins[0],y=outs[0];if(!x||!x.length)return true;
+    const a=par.amount[0],step=Math.pow(2,15-a*12),hold=1+Math.floor(a*a*24);
+    for(let ch=0;ch<y.length;ch++){const xi=x[ch]||x[0],yo=y[ch];let h=this.h[ch]||0,c=this.c[ch]||0;
+      for(let n=0;n<yo.length;n++){if(c<=0){h=Math.round(xi[n]*step)/step;c=hold}c--;yo[n]=h}
+      this.h[ch]=h;this.c[ch]=c}
+    return true}}
+registerProcessor('sk-crush',SKCrush);`;
+const revSeconds=()=>.5+S.revSize*5.5;
+const ECHO_BEATS=[.125,.25,.375,.5,.75,1,1.5,2],ECHO_NAMES=['1/32','1/16','1/16 dotted','1/8','1/8 dotted','1/4','1/4 dotted','1/2'];
+const echoSeconds=()=>Math.min(3.9,ECHO_BEATS[Math.round(S.echoTime)]*60/cur.seq.bpm);
+// drive: soft saturation curve, gently level-compensated; curves are cached per amount
+const driveCurves=new Map();
+function driveCurve(a){
+  const key=Math.round(a*100);if(driveCurves.has(key))return driveCurves.get(key);
+  const k=1+a*30,n=2048,c=new Float32Array(n),norm=Math.tanh(k),comp=1-a*.35;
+  for(let i=0;i<n;i++){const x=i/(n-1)*2-1;c[i]=Math.tanh(k*x)/norm*comp}
+  driveCurves.set(key,c);return c;
 }
 function impulse(sec){
   const len=Math.floor(ctx.sampleRate*sec),b=ctx.createBuffer(2,len,ctx.sampleRate);
@@ -499,16 +548,24 @@ function applyMix(){
   master.gain.setTargetAtTime(Math.pow(10,S.volumeDb/20),t,.02);
   filter.frequency.setTargetAtTime(cutoffHz(S.cutoff),t,.02);
   filterR.frequency.setTargetAtTime(cutoffHz(S.cutoff),t,.02);
+  const q=.7+S.reso*S.reso*17;filter.Q.setTargetAtTime(q,t,.02);filterR.Q.setTargetAtTime(q,t,.02);
+  echoDelay.delayTime.setTargetAtTime(echoSeconds(),t,.05);echoFbG.gain.setTargetAtTime(S.echoFb*.9,t,.02);
+  lfo.frequency.setTargetAtTime(S.lfoRate,t,.02);
+  wahD.gain.setTargetAtTime(S.wah*20,t,.02);wahR.gain.setTargetAtTime(S.wah*20,t,.02);wahDepth.gain.setTargetAtTime(S.wah*2400,t,.02);
+  if(Math.abs((conv.buffer?conv.buffer.duration:0)-revSeconds())>.05){clearTimeout(applyMix.rt);applyMix.rt=setTimeout(()=>{conv.buffer=impulse(revSeconds())},150)}
   voices.forEach(a=>a.forEach(v=>{
     if(v.src.detune)v.src.detune.setTargetAtTime((RT.bendSemis+S.tune)*100,t,.01);
     if(!v.ownRev){v.dg.gain.setTargetAtTime(1-S.reverb*.35,t,.02);v.wg.gain.setTargetAtTime(S.reverb*.9,t,.02)}
+    if(!v.ownEcho)v.eg.gain.setTargetAtTime(S.echo*.8,t,.02);
+    if(!v.ownChorus)v.cg.gain.setTargetAtTime(S.chorus*.9,t,.02);
   }));
 }
 
 /* =============== samples & editing model =============== */
 // attack, release and reverb of null follow the instrument's knobs; tone 1 = no extra filtering
 const defP=dur=>({start:0,end:dur,loop:false,loopStart:0,loopEnd:dur,fadeIn:0,fadeOut:0,gain:0,tune:0,reverse:false,vlo:1,vhi:127,
-  attack:null,release:null,tone:1,reverb:null,pan:0});
+  attack:null,release:null,tone:1,reverb:null,pan:0,
+  drive:null,crush:null,reso:null,echo:null,chorus:null,vib:null,trem:null,fenv:null,fenvTime:null});
 // sid: a stable id for the sound, saved and synced, so sequencer notes can point at it
 function makeSample(name,bytes,mime,raw,root,color){
   return {id:nextId++,sid:uid(),name,bytes,mime,raw,rev:null,buffer:null,root,color,version:0,p:defP(raw.duration)};
@@ -545,6 +602,8 @@ function normalizeP(p,dur){
   const opt=(v,a,b)=>v==null||v===''||isNaN(+v)?null:clamp(+v,a,b);
   p.attack=opt(p.attack,0,4);p.release=opt(p.release,.01,8);p.reverb=opt(p.reverb,0,1);
   p.tone=p.tone==null?1:clamp(+p.tone,0,1);p.pan=clamp(+p.pan||0,-1,1);
+  for(const k of ['drive','crush','reso','echo','chorus','vib','trem'])p[k]=opt(p[k],0,1);
+  p.fenv=opt(p.fenv,-1,1);p.fenvTime=opt(p.fenvTime,.02,4);
 }
 // Bake trim, reverse and fades into the buffer that actually plays (volume is applied per voice)
 function build(s){
@@ -599,31 +658,62 @@ function noteOn(note,vel=100){
   held.add(note);setKey(note,true);
   const m=mapNote(note+S.transpose,vel);if(!m) return;
   ensureAudio();if(ctx.state!=='running') return;
-  startVoice(m.s,m.rate,vel,note);
+  startVoice(m.s,m.rate,vel,note,0,null,{glideFrom:glideStart(note+S.transpose,m.rate)});
   recNoteOn(note+S.transpose,vel);
 }
-function startVoice(s,rate,vel,key,offset=0,when=null){
+// Glide: slide into a note from the previous one's pitch while that one is still held or ringing
+function glideStart(n,rate){
+  const now=ctx?ctx.currentTime:0,prev=RT.lastNote,ringing=prev!=null&&(held.size>1||now-RT.lastAt<S.release+.15);
+  RT.lastNote=n;RT.lastAt=now;
+  return S.glide>0&&ringing&&prev!==n?rate*Math.pow(2,(prev-n)/12):null;
+}
+const pick=(p,k)=>p[k]!=null?p[k]:S[k];   // a sound's own setting, or the instrument's
+function startVoice(s,rate,vel,key,offset=0,when=null,opt={}){
   const t=when===null?ctx.currentTime:Math.max(when,ctx.currentTime),p=s.p;
   const src=ctx.createBufferSource();
-  src.buffer=s.buffer;src.playbackRate.value=rate;
+  src.buffer=s.buffer;
+  if(opt.glideFrom){src.playbackRate.setValueAtTime(opt.glideFrom,t);src.playbackRate.exponentialRampToValueAtTime(rate,t+S.glide)}
+  else src.playbackRate.value=rate;
   if(src.detune) src.detune.value=(RT.bendSemis+S.tune)*100;
   const ls=p.loopStart-p.start,le=p.loopEnd-p.start;
   if(p.loop){src.loop=true;src.loopStart=ls;src.loopEnd=le}
   const g=ctx.createGain(),v=vel/127,amp=((1-S.velsens)+S.velsens*v*v)*Math.pow(10,p.gain/20),nodes=[g];
   let out=g,fq=Infinity;
+  const drive=pick(p,'drive');
+  if(drive>.005){const sh=ctx.createWaveShaper();sh.curve=driveCurve(drive);sh.oversample='2x';out.connect(sh);out=sh;nodes.push(sh)}
+  const crush=pick(p,'crush');
+  if(crush>.005&&crushReady){const cr=new AudioWorkletNode(ctx,'sk-crush',{outputChannelCount:[s.buffer.numberOfChannels]});cr.parameters.get('amount').value=crush;out.connect(cr);out=cr;nodes.push(cr)}
   if(S.vellayer)fq=1200+18800*Math.pow(v,1.5*S.velsens+.01);
   if(p.tone<.999)fq=Math.min(fq,cutoffHz(p.tone));
-  if(fq<20000){const f=ctx.createBiquadFilter();f.type='lowpass';f.frequency.value=fq;out.connect(f);out=f;nodes.push(f)}
+  const fenv=pick(p,'fenv');
+  if(fq<20000||Math.abs(fenv)>.01||p.reso!=null){
+    const f=ctx.createBiquadFilter();f.type='lowpass';f.Q.value=p.reso!=null?.7+p.reso*p.reso*17:.7;
+    const top=Math.min(fq,20000);
+    if(Math.abs(fenv)>.01){
+      // filter envelope: pluck (+) starts open and closes down; swell (−) starts closed and opens up
+      const shut=Math.min(top,cutoffHz(1-Math.abs(fenv)*.85)),[f0,f1]=fenv>0?[top,shut]:[shut,top],tt=pick(p,'fenvTime');
+      f.frequency.setValueAtTime(f0,t);f.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+tt);
+    }else f.frequency.value=top;
+    out.connect(f);out=f;nodes.push(f);
+  }
+  const trem=pick(p,'trem');
+  if(trem>.005){const tg=ctx.createGain(),td=ctx.createGain();tg.gain.value=1-trem*.5;td.gain.value=trem*.5;lfo.connect(td);td.connect(tg.gain);out.connect(tg);out=tg;nodes.push(tg,td)}
+  const vib=pick(p,'vib');
+  let vd=null;
+  if(vib>.005&&src.detune){vd=ctx.createGain();vd.gain.value=vib*60;lfo.connect(vd);vd.connect(src.detune);nodes.push(vd)}
   if(p.pan&&ctx.createStereoPanner){const pn=ctx.createStereoPanner();pn.pan.value=p.pan;out.connect(pn);out=pn;nodes.push(pn)}
-  const rv=p.reverb!=null?p.reverb:S.reverb,dg=ctx.createGain(),wg=ctx.createGain();
-  dg.gain.value=1-rv*.35;wg.gain.value=rv*.9;out.connect(dg);dg.connect(dryBus);out.connect(wg);wg.connect(revBus);nodes.push(dg,wg);
+  const rv=pick(p,'reverb'),ec=pick(p,'echo'),ch=pick(p,'chorus'),dg=ctx.createGain(),wg=ctx.createGain(),eg=ctx.createGain(),cg=ctx.createGain();
+  dg.gain.value=1-rv*.35;wg.gain.value=rv*.9;eg.gain.value=ec*.8;cg.gain.value=ch*.9;
+  out.connect(dg);dg.connect(dryBus);out.connect(wg);wg.connect(revBus);out.connect(eg);eg.connect(echoIn);out.connect(cg);cg.connect(chorusIn);
+  nodes.push(dg,wg,eg,cg);
   src.connect(g);
   g.gain.setValueAtTime(0,t);
   g.gain.linearRampToValueAtTime(amp,t+Math.max(.003,p.attack!=null?p.attack:S.attack));
   src.start(t,offset);
   const voice={src,g,amp,key,s,t0:t,rate,off:offset,loop:p.loop,ls,le,len:s.buffer.duration,st:p.start,sustained:false,
-    rel:p.release!=null?p.release:S.release,dg,wg,ownRev:p.reverb!=null};
-  src.onended=()=>{voice.done=true;const a=voices.get(key);if(a){const i=a.indexOf(voice);if(i>=0)a.splice(i,1)}nodes.forEach(n=>{try{n.disconnect()}catch(e){}})};
+    rel:p.release!=null?p.release:S.release,dg,wg,eg,cg,ownRev:p.reverb!=null,ownEcho:p.echo!=null,ownChorus:p.chorus!=null};
+  src.onended=()=>{voice.done=true;const a=voices.get(key);if(a){const i=a.indexOf(voice);if(i>=0)a.splice(i,1)}
+    nodes.forEach(n=>{try{n.disconnect()}catch(e){}try{lfo.disconnect(n)}catch(e){}})};
   if(!voices.has(key)) voices.set(key,[]);
   voices.get(key).push(voice);
   limitPolyphony();
@@ -970,7 +1060,9 @@ function playStep(i,t){
   for(const n of cur.seq.notes){
     if(n.s!==i)continue;
     const m=soundFor(n.n,n.v,n.sid);if(!m)continue;
-    const v=startVoice(m.s,m.rate,n.v,1000+n.n,0,t),end=t+n.l*sd;
+    const solo=cur.seq.notes.filter(x=>x.s===i).length===1,from=solo&&S.glide>0&&SEQ.lastN!=null&&SEQ.lastN!==n.n?m.rate*Math.pow(2,(SEQ.lastN-n.n)/12):null;
+    if(solo)SEQ.lastN=n.n;
+    const v=startVoice(m.s,m.rate,n.v,1000+n.n,0,t,{glideFrom:from}),end=t+n.l*sd;
     if(!(S.oneshot&&!v.loop))release(v,null,end);
     const k=keyEls[n.n-S.transpose];
     if(k){setTimeout(()=>k.classList.add('seqdown'),(t-now)*1000);setTimeout(()=>k.classList.remove('seqdown'),(end-now)*1000-15)}
@@ -1024,7 +1116,7 @@ $('sRec').onclick=()=>{SEQ.rec=!SEQ.rec;if(SEQ.rec&&!SEQ.playing)seqPlay();syncT
 $('sBpm').addEventListener('change',e=>{
   const sq=cur.seq,bpm=clamp(Math.round(+e.target.value)||sq.bpm,40,240);
   if(SEQ.playing){const next=stepTime(SEQ.step);sq.bpm=bpm;const sd=stepDur();SEQ.barStart=next-SEQ.step*sd-swingOff(SEQ.step,sd)}
-  sq.bpm=bpm;syncTransport();markDirty();
+  sq.bpm=bpm;syncTransport();applyMix();markDirty();
 });
 $('sSteps').onchange=e=>{cur.seq.steps=+e.target.value;renderSeq();markDirty()};
 $('sLen').onchange=e=>{cur.seq.len=+e.target.value;markDirty()};
@@ -1208,7 +1300,7 @@ function syncFields(){
 function commitEdit(){
   if(!sel) return;
   normalizeP(sel.p,durOf(sel));build(sel);syncFields();renderSamples();edDirty=true;markDirty();
-  if(knobScope==='sound')KNOBSETS.sound.forEach(updateParamUI);
+  if(knobScope==='sound')SOUND_KNOBS.forEach(updateParamUI);
 }
 [...TIMEF,...MSF,...NUMF].forEach(k=>$('f-'+k).addEventListener('change',e=>{
   if(!sel) return;let v=parseFloat(e.target.value);if(isNaN(v)){syncFields();return}
@@ -1363,9 +1455,34 @@ const PARAMS={
   s_tone:{label:'Tone',min:0,max:1,field:'tone',def:1,fmt:v=>v>=.999?'open':Math.round(cutoffHz(v))+' Hz'},
   s_reverb:{label:'Reverb',min:0,max:1,field:'reverb',inherit:'reverb',fmt:pct},
   s_pan:{label:'Pan',min:-1,max:1,step:.01,field:'pan',def:0,fmt:v=>Math.abs(v)<.005?'center':(v<0?'L ':'R ')+Math.round(Math.abs(v)*100)},
+  // effects (instrument)
+  drive:{label:'Drive',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  crush:{label:'Lo-fi',min:0,max:1,fmt:v=>v<.005?'off':`${Math.round(16-v*12)}-bit`},
+  reso:{label:'Resonance',min:0,max:1,fmt:pct},
+  echo:{label:'Echo',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  echoTime:{label:'Echo time',min:0,max:7,step:1,fmt:v=>ECHO_NAMES[Math.round(v)]},
+  echoFb:{label:'Feedback',min:0,max:.95,fmt:pct},
+  revSize:{label:'Reverb size',min:0,max:1,fmt:v=>revSecondsOf(v)},
+  chorus:{label:'Chorus',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  vib:{label:'Vibrato',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  trem:{label:'Tremolo',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  wah:{label:'Wah',min:0,max:1,fmt:v=>v<.005?'off':pct(v)},
+  lfoRate:{label:'Rate',min:.1,max:12,curve:2,fmt:v=>v.toFixed(v<1?2:1)+' Hz'},
+  fenv:{label:'Filter env',min:-1,max:1,fmt:v=>Math.abs(v)<.01?'off':(v>0?'pluck ':'swell ')+Math.round(Math.abs(v)*100)+'%'},
+  fenvTime:{label:'Env time',min:.02,max:4,curve:2.5,fmt:fmtTime},
+  glide:{label:'Glide',min:0,max:1.5,curve:2,fmt:v=>v<.002?'off':fmtTime(v)},
 };
-const KNOBSETS={inst:['attack','release','cutoff','reverb','velsens','bend','transpose'],sound:['s_tune','s_gain','s_attack','s_release','s_tone','s_reverb','s_pan']};
-let knobScope='inst';
+// "This sound" versions of the effects that can be set per sound; they follow the instrument until turned
+for(const k of ['drive','crush','reso','echo','chorus','vib','trem','fenv','fenvTime'])PARAMS['s_'+k]={...PARAMS[k],field:k,inherit:k};
+const KNOBPAGES={
+  inst:{main:['attack','release','cutoff','reverb','velsens','bend','transpose'],character:['drive','crush','reso'],
+    space:['echo','echoTime','echoFb','revSize'],movement:['chorus','vib','trem','wah','lfoRate'],shape:['fenv','fenvTime','glide']},
+  sound:{main:['s_tune','s_gain','s_attack','s_release','s_tone','s_reverb','s_pan'],character:['s_drive','s_crush','s_reso'],
+    space:['s_echo'],movement:['s_chorus','s_vib','s_trem'],shape:['s_fenv','s_fenvTime']},
+};
+const SOUND_KNOBS=Object.values(KNOBPAGES.sound).flat();
+const revSecondsOf=v=>(.5+v*5.5).toFixed(1)+' s';
+let knobScope='inst',knobPage='main';
 const inherits=k=>{const d=PARAMS[k];return !!(d.inherit&&sel&&sel.p[d.field]==null)};
 function getP(k){
   const d=PARAMS[k];if(!d.field)return S[k];
@@ -1384,7 +1501,7 @@ function setParam(k,v,save=true){
     return;
   }
   S[k]=clamp(v,d.min,d.max);
-  if(d.label)KNOBSETS.sound.forEach(x=>{if(PARAMS[x].inherit===k)updateParamUI(x)});
+  if(d.label)SOUND_KNOBS.forEach(x=>{if(PARAMS[x].inherit===k)updateParamUI(x)});
   if(k==='transpose'){
     voices.forEach((a,key)=>{if(key>=0&&key<1000)a.forEach(v=>{try{v.src.stop()}catch(e){}})});
     held.forEach(n=>setKey(n,false));held.clear();refreshZones();
@@ -1423,8 +1540,9 @@ function renderKnobs(){
   const box=$('knobs'),A0=Math.PI*.75,A1=Math.PI*2.25;box.innerHTML='';
   if(knobScope==='sound'&&!sel)knobScope='inst';
   [...$('kScope').children].forEach(b=>b.classList.toggle('sel',b.dataset.s===knobScope));
+  [...$('kPage').children].forEach(b=>b.classList.toggle('sel',b.dataset.pg===knobPage));
   $('kName').innerHTML=knobScope==='sound'?`<i style="background:${sel.color}"></i>${esc(sel.name)}`:'';
-  for(const k of KNOBSETS[knobScope]){
+  for(const k of KNOBPAGES[knobScope][knobPage]){
     const el=document.createElement('div');el.className='knob';el.dataset.k=k;el.title='Drag up/down · shift for fine · double-click to reset';
     el.innerHTML=`<svg viewBox="0 0 50 50"><path d="${arcPath(A0,A1,20)}" stroke="#3a3f49" stroke-width="4" fill="none" stroke-linecap="round"/>
       <path class="val" stroke="var(--accent)" stroke-width="4" fill="none" stroke-linecap="round"/>
@@ -1433,6 +1551,7 @@ function renderKnobs(){
     box.appendChild(el);makeDraggable(el,k);updateParamUI(k);
   }
 }
+$('kPage').onclick=e=>{const b=e.target.closest('button');if(!b)return;knobPage=b.dataset.pg;renderKnobs()};
 $('kScope').onclick=e=>{
   const b=e.target.closest('button');if(!b)return;
   if(b.dataset.s==='sound'&&!sel){toast('Pick a sound first: tap one in the Samples list or the sequencer’s Sound menu');return}
