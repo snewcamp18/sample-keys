@@ -5,8 +5,11 @@
  *    natively), and a new note shows up as a sudden rise in level across the bands ("spectral flux"). Using
  *    rises rather than levels finds a note even while the previous one is still ringing.
  * 2. Pitch: YIN pitch detection on a short window just after each attack.
- * 3. Keys: when the notes were played in order, the most common (detected key − position) fixes the whole
- *    run at once, so a few octave mistakes on bass notes can't shift the rest.
+ * 3. Keys: when the notes were played in order, a best-path search (dynamic programming) finds the run of keys
+ *    that fits the heard pitches best while only moving one way along the keyboard. Repeated strikes, skipped
+ *    keys and stray triggers are allowed, so a few wrong pitch readings on bass notes can't shift the rest.
+ *    Keys struck more than once become "takes": the clearest one is used, or the quieter and louder ones can
+ *    become the soft and loud velocity layers.
  * All notes reference the same recording; each sample's start/end marks its slice.
  *
  * Shares the page's global scope with index.html (samples, makeSample, build, noteName, …).
@@ -135,11 +138,17 @@
       p.pitch = A.pitchCache.get(key);
       if (k % 8 === 7) { A.prog = .45 + .5 * k / peaks.length; if (A.reviewing) { } else progress(`Working out pitches… ${k + 1} of ${peaks.length}`); await tick(); if (A.cancel) return }
     }
-    A.rows = peaks.map(p => ({ start: p.start, end: p.end, pitch: p.pitch, on: true, key: null }));
+    A.rows = peaks.map(p => ({ start: p.start, end: p.end, pitch: p.pitch, level: levelOf(p.start, p.end), on: true, key: null }));
     if (!A.order) A.order = 'up';
     assign();
   }
 
+  // how hard a note was struck: its peak in the first 300 ms
+  function levelOf(start, end) {
+    const { mono, sr } = A, a = Math.floor(start * sr), z = Math.min(mono.length, Math.floor(Math.min(end, start + .3) * sr));
+    let pk = 0; for (let i = a; i < z; i++) { const v = mono[i] < 0 ? -mono[i] : mono[i]; if (v > pk) pk = v }
+    return pk;
+  }
   function detectPitch(start, end) {
     const { mono, sr } = A, dec = Math.max(1, Math.round(sr / 16000)), fs = sr / dec;
     const a0 = start + Math.min(.06, (end - start) * .25), len = Math.min(end - a0, .16);
@@ -164,23 +173,78 @@
     return midi >= 20 && midi <= 110 ? midi : null;
   }
 
+  // How well a heard pitch fits a key, in semitones (capped). Piano notes are often heard an octave, an octave and
+  // a fifth, or two octaves too high (strong overtones, weak fundamental in the bass), so those cost a little more.
+  function fit(r, k) {
+    if (r.pitch == null) return .6;
+    const p = r.pitch;
+    return Math.min(2.5, Math.abs(p - k), Math.abs(p - 12 - k) + .5, Math.abs(p - 19 - k) + .7, Math.abs(p - 24 - k) + .7, Math.abs(p + 12 - k) + .8);
+  }
+  // Costs for the path search. Striking a key a second time is normal; a third or later time at the normal
+  // playing pace is unusual, so it costs more (this keeps a few misheard bass notes from being lumped onto one key).
+  // A strike within RETRIGGER seconds of the previous one is usually a stray trigger, so it stays cheap.
+  const REPEAT = .4, REPEAT_MORE = 1.5, RETRIGGER = .8, RETRIGGER_COST = .1, SKIP = 1.5;
   // keys for each included note, from the playing order
   function assign(firstOverride) {
-    const rows = A.rows.filter(r => r.on), dir = A.order === 'down' ? -1 : 1;
-    if (A.order === 'any') {
-      const used = new Set();
-      for (const r of rows) { r.key = r.pitch == null ? null : Math.round(r.pitch); r.dup = r.key != null && used.has(r.key); if (r.key != null) used.add(r.key) }
-    } else {
-      let first = firstOverride;
-      if (first == null) {
-        const votes = new Map();
-        rows.forEach((r, i) => { if (r.pitch != null) { const o = Math.round(r.pitch) - dir * i; votes.set(o, (votes.get(o) || 0) + 1) } });
-        first = [...votes].sort((a, b) => b[1] - a[1])[0]?.[0] ?? (dir > 0 ? 21 : 108);
+    A.rows.forEach(r => { r.key = null; r.manual = false });
+    const rows = A.rows.filter(r => r.on);
+    if (!rows.length) { groupTakes(); return }
+    if (A.order === 'any') { for (const r of rows) r.key = r.pitch == null ? null : Math.round(r.pitch) }
+    else {
+      // state = (key index j, normal-pace repeats so far c ∈ 0..2); dp holds the cheapest path cost ending there
+      const dir = A.order === 'down' ? -1 : 1, K = HIGH - LOW + 1, C = 3, keyAt = j => dir > 0 ? LOW + j : HIGH - j, n = rows.length;
+      let dp = new Float64Array(K * C).fill(Infinity);
+      for (let j = 0; j < K; j++) if (firstOverride == null || keyAt(j) === firstOverride) dp[j * C] = fit(rows[0], keyAt(j));
+      const back = [];
+      for (let i = 1; i < n; i++) {
+        const nd = new Float64Array(K * C).fill(Infinity), bk = new Int32Array(K * C).fill(-1);
+        const quick = rows[i].start - rows[i - 1].start < RETRIGGER;
+        // best way to be on each key with any repeat count, for moving on to a later key
+        const best = new Float64Array(K), bestAt = new Int32Array(K);
+        for (let j = 0; j < K; j++) { let m = Infinity, at = -1; for (let c = 0; c < C; c++) if (dp[j * C + c] < m) { m = dp[j * C + c]; at = j * C + c } best[j] = m; bestAt[j] = at }
+        let runMin = Infinity, runAt = -1;
+        for (let j = 0; j < K; j++) {
+          const f = fit(rows[i], keyAt(j));
+          for (let c = 0; c < C; c++) {   // strike the same key again
+            const from = j * C + c; if (dp[from] === Infinity) continue;
+            const c2 = quick ? c : Math.min(c + 1, C - 1), cost = dp[from] + (quick ? RETRIGGER_COST : c === 0 ? REPEAT : REPEAT_MORE) + f;
+            if (cost < nd[j * C + c2]) { nd[j * C + c2] = cost; bk[j * C + c2] = from }
+          }
+          let mv = Infinity, mvAt = -1;
+          if (j >= 1) { mv = best[j - 1]; mvAt = bestAt[j - 1] }                        // the next key
+          if (j >= 2) {                                                                   // jumped over j-j'-1 keys
+            const v = best[j - 2] - SKIP * (j - 2); if (v < runMin) { runMin = v; runAt = bestAt[j - 2] }
+            const sk = runMin + SKIP * (j - 1); if (sk < mv) { mv = sk; mvAt = runAt }
+          }
+          if (mv + f < nd[j * C]) { nd[j * C] = mv + f; bk[j * C] = mvAt }
+        }
+        back.push(bk); dp = nd;
       }
-      A.first = first;
-      rows.forEach((r, i) => { r.key = first + dir * i; r.dup = false; if (r.key < LOW || r.key > HIGH) r.key = null });
+      let st = 0; for (let x = 1; x < K * C; x++) if (dp[x] < dp[st]) st = x;
+      for (let i = n - 1; i >= 0; i--) { rows[i].key = keyAt(Math.floor(st / C)); if (i) st = back[i - 1][st] }
+      A.first = rows[0].key;
     }
-    for (const r of A.rows) if (!r.on) r.key = null;
+    groupTakes();
+  }
+  // Keys struck more than once: keep the clearest take, or use the quieter and louder ones as soft and loud layers.
+  function groupTakes() {
+    const by = new Map();
+    A.rows.forEach(r => { r.extra = false; r.layer = null; if (r.on && r.key != null) { if (!by.has(r.key)) by.set(r.key, []); by.get(r.key).push(r) } });
+    A.multi = 0;
+    for (const takes of by.values()) {
+      if (takes.length < 2) continue;
+      A.multi++;
+      if (A.dupMode === 'layers') {
+        const s = [...takes].sort((a, b) => a.level - b.level);
+        s[0].layer = 'soft'; s[s.length - 1].layer = 'loud';
+        s.slice(1, -1).forEach(r => r.extra = true);
+      } else {
+        const score = r => (r.pitch == null ? 1 : Math.min(1, Math.abs(r.pitch - r.key))) - Math.min(r.end - r.start, 3) * .3;
+        const best = takes.reduce((a, b) => score(b) < score(a) ? b : a);
+        takes.forEach(r => { if (r !== best) r.extra = true });
+      }
+    }
+    A.keys = by.size;
   }
 
   /* ---------- review ---------- */
@@ -193,11 +257,12 @@
       <div class="amopts">
         <label class="tf">Played <select id="amOrder"><option value="up">in order, low to high</option><option value="down">in order, high to low</option><option value="any">in any order</option></select></label>
         <label class="tf" id="amFirstWrap">First note <select id="amFirst"></select></label>
+        <label class="tf" id="amDupWrap">Keys played more than once <select id="amDup"><option value="best">use the clearest take</option><option value="layers">quieter = soft, louder = loud layer</option></select></label>
         <label class="tf">Note detection <span class="hint">fewer</span><input type="range" id="amSens" min="0" max="1" step="0.01" value="${A.sens}"><span class="hint">more</span></label>
       </div>
       <div class="amlist" id="amList"></div>
       <div class="amdest">
-        <label class="tf">Velocity layer <select id="amLayer"><option value="all">All velocities (one take)</option><option value="soft">Soft layer: velocity 1–79</option><option value="loud">Loud layer: velocity 80–127</option></select></label>
+        <label class="tf" id="amLayerWrap">Velocity layer <select id="amLayer"><option value="all">All velocities (one take)</option><option value="soft">Soft layer: velocity 1–79</option><option value="loud">Loud layer: velocity 80–127</option></select></label>
         <p class="hint" style="margin:0">For soft and loud layers, record the keys twice. Map the first take as a new instrument, then the second with “Add to”.</p>
         <label class="chk"><input type="radio" name="amDest" value="new" checked> New instrument named</label>
         <input class="tx" id="amName" value="${esc(base)}" autocomplete="off">
@@ -209,6 +274,8 @@
     $('amOrder').value = A.order;
     $('amOrder').onchange = e => { A.order = e.target.value; assign(); refresh() };
     $('amFirst').onchange = e => { assign(+e.target.value); refresh() };
+    $('amDup').value = A.dupMode || 'best';
+    $('amDup').onchange = e => { A.dupMode = e.target.value; groupTakes(); refresh() };
     let sensT;
     $('amSens').oninput = e => { clearTimeout(sensT); sensT = setTimeout(async () => { await pick(+e.target.value); refresh() }, 150) };
     $('amGo').onclick = apply;
@@ -216,31 +283,35 @@
   }
   function refresh() {
     const $ = id => document.getElementById(id); if (!A || !$('amList')) return;
-    const on = A.rows.filter(r => r.on && r.key != null), flagged = A.rows.filter(r => r.on && flag(r)).length;
+    const used = A.rows.filter(r => r.on && r.key != null && !r.extra), flagged = A.rows.filter(r => r.on && flag(r)).length;
+    const extras = A.rows.filter(r => r.on && r.extra).length, layered = A.dupMode === 'layers' && A.multi > 0;
     $('amTitle').textContent = `Found ${A.rows.length} note${A.rows.length === 1 ? '' : 's'}`;
     $('amFirstWrap').hidden = A.order === 'any';
     $('amFirst').innerHTML = keyOpts(A.first ?? 21);
-    $('amGo').textContent = on.length ? `Map ${on.length} note${on.length === 1 ? '' : 's'} to keys` : 'Nothing to map';
-    $('amGo').disabled = !on.length;
-    const keys = on.map(r => r.key);
-    $('amList').innerHTML = `<div class="amsum">${on.length ? `${noteName(Math.min(...keys))} to ${noteName(Math.max(...keys))}` : ''}${flagged ? ` · <b>${flagged} to check</b> (⚠)` : ''}</div>` +
-      A.rows.map((r, i) => `<div class="amrow ${r.on ? '' : 'off'} ${r.on && flag(r) ? 'warn' : ''}" data-i="${i}">
+    $('amDupWrap').hidden = !A.multi;
+    $('amLayerWrap').hidden = layered;
+    const nk = new Set(used.map(r => r.key)).size;
+    $('amGo').textContent = nk ? `Map ${nk} key${nk === 1 ? '' : 's'}${layered ? ' with soft and loud layers' : ''}` : 'Nothing to map';
+    $('amGo').disabled = !nk;
+    const keys = used.map(r => r.key);
+    $('amList').innerHTML = `<div class="amsum">${nk ? `${noteName(Math.min(...keys))} to ${noteName(Math.max(...keys))} · ${nk} keys` : ''}${A.multi ? ` · ${A.multi} played more than once` : ''}${extras ? ` · ${extras} extra take${extras === 1 ? '' : 's'} not used` : ''}${flagged ? ` · <b>${flagged} to check</b> (⚠)` : ''}</div>` +
+      A.rows.map((r, i) => `<div class="amrow ${r.on && !r.extra ? '' : 'off'} ${r.on && flag(r) ? 'warn' : ''}" data-i="${i}">
         <input type="checkbox" ${r.on ? 'checked' : ''} aria-label="Include note ${i + 1}">
         <span class="amn">${i + 1}</span><span class="amt">${fmtT(r.start)}</span>
-        <span class="amp">${r.pitch == null ? 'pitch unclear' : 'heard ' + noteName(Math.round(r.pitch)) + ' ' + cents(r.pitch)}</span>
+        <span class="amp">${r.pitch == null ? 'pitch unclear' : 'heard ' + noteName(Math.round(r.pitch)) + ' ' + cents(r.pitch)}${r.on && r.extra ? ' · extra take' : r.layer ? ' · ' + r.layer : ''}</span>
         <select ${r.on ? '' : 'disabled'} aria-label="Key for note ${i + 1}"><option value="">—</option>${keyOpts(r.key)}</select>
         <button class="btn sm" title="Preview">▶</button></div>`).join('');
     $('amList').querySelectorAll('.amrow').forEach(el => {
       const r = A.rows[+el.dataset.i];
       el.querySelector('input').onchange = e => { r.on = e.target.checked; assign(A.order === 'any' ? undefined : A.first); refresh() };
-      el.querySelector('select').onchange = e => { r.key = e.target.value === '' ? null : +e.target.value; r.dup = false; refresh() };
+      el.querySelector('select').onchange = e => { r.key = e.target.value === '' ? null : +e.target.value; r.manual = true; groupTakes(); refresh() };
       el.querySelector('button').onclick = () => preview(r);
     });
     drawOverview();
   }
   const cents = m => { const c = Math.round((m - Math.round(m)) * 100); return c ? `${c > 0 ? '+' : '−'}${Math.abs(c)}¢` : '' };
   // a note whose heard pitch disagrees with its key (ignoring octave slips, which are common on piano bass notes)
-  const flag = r => r.key == null || r.dup || (r.pitch != null && Math.abs(((Math.round(r.pitch) - r.key) % 12 + 12) % 12) > 0);
+  const flag = r => !r.extra && !r.manual && (r.key == null || (r.pitch != null && Math.abs(((Math.round(r.pitch) - r.key) % 12 + 12) % 12) > 0));
 
   function drawOverview() {
     const cv = document.getElementById('amWave'); if (!cv) return;
@@ -251,7 +322,7 @@
       let pk = 0; for (let i = Math.floor(x * step), z = Math.floor((x + 1) * step); i < z; i += 4) { const v = Math.abs(m[i]); if (v > pk) pk = v }
       const h = Math.max(1, pk * H * .9); g.fillRect(x, (H - h) / 2, 1, h);
     }
-    for (const row of A.rows) { g.fillStyle = !row.on ? '#ffffff30' : flag(row) ? '#ff6b6b' : '#f2a23a'; g.fillRect(row.start / A.raw.duration * W, 0, Math.max(1, r), H) }
+    for (const row of A.rows) { g.fillStyle = !row.on || row.extra ? '#ffffff30' : flag(row) ? '#ff6b6b' : '#f2a23a'; g.fillRect(row.start / A.raw.duration * W, 0, Math.max(1, r), H) }
   }
   function stopPreview() { if (previewSrc) { try { previewSrc.stop() } catch (e) {} previewSrc = null } }
   function preview(r) {
@@ -263,12 +334,14 @@
 
   /* ---------- apply ---------- */
   async function apply() {
-    const rows = A.rows.filter(r => r.on && r.key != null);
-    const seen = new Set(), use = [];
-    for (const r of rows) if (!seen.has(r.key)) { seen.add(r.key); use.push(r) }   // first take of a key wins
+    const use = A.rows.filter(r => r.on && r.key != null && !r.extra), seen = new Set(use.map(r => r.key));
     const toNew = document.querySelector('input[name=amDest]:checked').value === 'new';
     const name = (document.getElementById('amName').value.trim() || 'Recorded instrument');
-    const layer = document.getElementById('amLayer').value, [vlo, vhi] = { all: [1, 127], soft: [1, 79], loud: [80, 127] }[layer];
+    const RANGE = { all: [1, 127], soft: [1, 79], loud: [80, 127] };
+    // one take per key: the chosen velocity layer; keys with soft/loud takes: each take its own layer
+    const layered = A.dupMode === 'layers' && A.multi > 0;
+    const layer = layered ? 'both' : document.getElementById('amLayer').value, [vlo, vhi] = layered ? [1, 127] : RANGE[layer];
+    const rangeOf = r => layered ? RANGE[r.layer || 'all'] : [vlo, vhi];
     const overlaps = s => s.p.vlo <= vhi && vlo <= s.p.vhi;
     const { bytes, mime, raw } = A;
     stopPreview();
@@ -285,21 +358,23 @@
     // one volume boost for the whole take, so the notes keep their natural balance. When this take is a second
     // velocity layer, both layers share the smaller boost so the soft take stays softer than the loud one.
     let boost = autoGain(peakOf(raw));
-    const otherLayer = toNew || layer === 'all' ? [] : samples.filter(s => !overlaps(s));
+    const otherLayer = toNew || layer === 'all' || layered ? [] : samples.filter(s => !overlaps(s));
     if (otherLayer.length) {
       const theirs = Math.max(...otherLayer.map(s => s.p.gain));
       if (boost < theirs) otherLayer.forEach(s => { s.p.gain = +(s.p.gain - (theirs - boost)).toFixed(1) });
       else boost = theirs;
     }
-    use.sort((a, b) => a.key - b.key).forEach((r, i) => {
-      const s = makeSample(`${label} ${noteName(r.key)}${layer === 'all' ? '' : ' ' + layer}`, bytes, mime, raw, r.key, COLORS[i % COLORS.length]);
-      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2), vlo, vhi, gain: boost });
+    const keyList = [...seen].sort((a, b) => a - b);
+    use.sort((a, b) => a.key - b.key || (a.layer === 'loud') - (b.layer === 'loud')).forEach(r => {
+      const tag = layered ? r.layer || '' : layer === 'all' ? '' : layer, [lo, hi] = rangeOf(r);
+      const s = makeSample(`${label} ${noteName(r.key)}${tag ? ' ' + tag : ''}`, bytes, mime, raw, r.key, COLORS[keyList.indexOf(r.key) % COLORS.length]);
+      Object.assign(s.p, { start: r.start, end: r.end, loopStart: r.start, loopEnd: r.end, fadeIn: .002, fadeOut: Math.min(.06, (r.end - r.start) * .2), vlo: lo, vhi: hi, gain: boost });
       normalizeP(s.p, raw.duration); build(s); samples.push(s);
     });
-    selectSample(samples.find(s => s.root === use[0].key) || samples[0] || null);
+    selectSample(samples.find(s => s.root === keyList[0]) || samples[0] || null);
     seqScrollTo = true;
     updateFace(); renderSamples(); refreshZones(); syncFields(); renderSeq(); markDirty();
-    toast(`Mapped ${use.length} note${use.length === 1 ? '' : 's'}${use.length ? ` from ${noteName(use[0].key)} to ${noteName(use[use.length - 1].key)}` : ''}${layer === 'all' ? '' : ` as the ${layer} layer`}${boost >= 3 ? ` · volume raised ${boost} dB` : ''}`);
+    toast(`Mapped ${keyList.length} key${keyList.length === 1 ? '' : 's'}${keyList.length ? ` from ${noteName(keyList[0])} to ${noteName(keyList[keyList.length - 1])}` : ''}${layered ? ' with soft and loud layers' : layer === 'all' ? '' : ` as the ${layer} layer`}${boost >= 3 ? ` · volume raised ${boost} dB` : ''}`);
   }
 
   /* ---------- entry points ---------- */
