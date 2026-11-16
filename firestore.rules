@@ -6,6 +6,8 @@ rules_version = '2';
 //    together with a matching chunk upload or deletion, so it can't be reset or edited on its own.
 //  - Instrument and file-info documents must have the shape the app writes.
 //  - Shared instruments live in /shares; their sound files become readable to others only while marked public.
+//  - FitTrack (snewcamp18.github.io/fittrack) shares this project's sign-in and keeps each person's training log
+//    under /fittrack/{uid}. These rules are the only copy for the whole project: keep the FitTrack section when editing.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -112,6 +114,27 @@ service cloud.firestore {
               && request.resource.data.bytes == usedBefore(uid) - get(chunkPath(uid, request.resource.data.last.split(':')[1])).data.d.size())
           );
         allow delete: if signedIn(uid) && resource.data.bytes == 0;
+      }
+    }
+
+    // FitTrack: each person's training log, readable and writable only by them.
+    //   fittrack/{uid}                 settings, weigh-ins, check-ins, plan changes
+    //   fittrack/{uid}/workouts/{id}   one per logged session (deleted ones stay as tombstones)
+    match /fittrack/{uid} {
+      allow read, delete: if signedIn(uid);
+      allow create, update: if signedIn(uid)
+        && request.resource.data.keys().hasOnly(['updated', 'meta'])
+        && request.resource.data.updated is number
+        && request.resource.data.meta is map;
+
+      match /workouts/{id} {
+        allow read, delete: if signedIn(uid);
+        allow create, update: if signedIn(uid)
+          && id.size() <= 40
+          && request.resource.data.keys().hasOnly(['updated', 'deleted', 'w'])
+          && request.resource.data.updated is number
+          && request.resource.data.deleted is bool
+          && (request.resource.data.w == null || request.resource.data.w is map);
       }
     }
   }

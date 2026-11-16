@@ -25,7 +25,8 @@ The values in `firebase-config.js` identify your project; they aren't secret. Wh
 `firestore.rules`: each signed-in person can read and write only their own instruments, records must have the
 shape the app writes, and each person can store at most 150 MB of sound (change `quota()` in the rules and
 `quotaBytes` in `firebase-config.js` together to adjust it). Whenever `firestore.rules` changes, paste the new
-version into **Firestore Database → Rules** and click **Publish**.
+version into **Firestore Database → Rules** and click **Publish**. The file also holds the rules for FitTrack, which shares this project's sign-in
+(the `fittrack` section); keep that section when editing.
 
 People can delete their own account and cloud data from **SYNC → Delete my account…**. As the project owner
 you can still see everyone's synced data in the Firebase console.
